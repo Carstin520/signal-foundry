@@ -5,13 +5,15 @@ from typer.testing import CliRunner
 from quant_sol.signals.accounts import match_web3_narratives, rank_accounts
 from quant_sol.signals.cli import app
 from quant_sol.signals.config import Web3NarrativeKeywords
-from quant_sol.signals.storage import connect, upsert_x_accounts, upsert_x_follow_graph, upsert_x_posts
+from quant_sol.signals.models import MarketRecord
+from quant_sol.signals.storage import connect, insert_market_tick, upsert_markets, upsert_x_accounts, upsert_x_follow_graph, upsert_x_posts
 
 
 KEYWORDS = Web3NarrativeKeywords(
     groups={
         "airdrop": ("airdrop", "claim", "空投", "积分"),
         "listings": ("listing", "coinbase", "上币"),
+        "ecosystems": ("HYPE", "Hyperliquid"),
     },
     role_weights={
         "originators": 25,
@@ -59,7 +61,9 @@ def test_rank_accounts_rewards_earliest_source_and_builds_source_chain(tmp_path)
     assert by_account["UpstreamAlpha"]["source_chain_score"] > 0
     assert by_account["SpamPump"]["cascade_score"] <= 0.5
     assert by_account["SpamPump"]["frequency_score"] <= 8
-    assert by_account["OfficialProject"]["recommended_status"] != "ranked"
+    assert by_account["OfficialProject"]["recommended_status"] == "confirmation_source"
+    assert by_account["OfficialProject"]["final_score"] == 0
+    assert by_account["UpstreamAlpha"]["recommended_status"] == "insufficient_market_data"
 
     chains = con.execute(
         """
@@ -69,6 +73,96 @@ def test_rank_accounts_rewards_earliest_source_and_builds_source_chain(tmp_path)
         """
     ).fetchall()
     assert chains == [("BigInfluencer", "UpstreamAlpha", "following_lead")]
+
+
+def test_rank_accounts_uses_market_ticks_for_impact_score(tmp_path) -> None:
+    con = connect(tmp_path / "accounts.duckdb")
+    upsert_x_accounts(
+        con,
+        [
+            {"handle": "Lookonchain", "language": "en", "region": "global", "role": "originators", "priority": "seed", "status": "active"},
+        ],
+    )
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    upsert_x_posts(
+        con,
+        [
+            _post("hype-1", "Lookonchain", now - timedelta(hours=24), "Whales are buying HYPE longs on Hyperliquid", 30),
+        ],
+    )
+    upsert_markets(
+        con,
+        [
+            MarketRecord(
+                market_slug="will-hype-hit-50-this-month",
+                event_slug="hype-price",
+                question="Will HYPE hit $50 this month?",
+                category="Crypto",
+                tags=["Crypto", "Hyperliquid"],
+                end_time=(now + timedelta(days=20)).isoformat(),
+                resolution_source=None,
+                clob_token_ids=["yes-token"],
+                liquidity=100_000,
+                raw={},
+            )
+        ],
+    )
+    insert_market_tick(con, (now - timedelta(hours=25)).isoformat(), "will-hype-hit-50-this-month", "yes-token", 0.19, 0.21, None, 100_000, {})
+    insert_market_tick(con, (now - timedelta(hours=1)).isoformat(), "will-hype-hit-50-this-month", "yes-token", 0.27, 0.29, None, 100_000, {})
+
+    rows = rank_accounts(con, "30d", KEYWORDS)
+    account = {row["account"]: row for row in rows}["Lookonchain"]
+
+    assert account["sample_size"] == 1
+    assert account["market_impact_score"] > 0
+    assert account["hit_rate_24h"] == 1
+    assert account["recommended_status"] != "insufficient_market_data"
+
+
+def test_fast_web3_accounts_can_match_non_web3_markets(tmp_path) -> None:
+    con = connect(tmp_path / "accounts.duckdb")
+    upsert_x_accounts(
+        con,
+        [
+            {"handle": "FastCryptoCurator", "language": "en", "region": "global", "role": "fast_curators", "priority": "seed", "status": "active"},
+        ],
+    )
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    upsert_x_posts(
+        con,
+        [
+            _post("politics-1", "FastCryptoCurator", now - timedelta(hours=24), "Trump nominee odds are starting to rally after donor chatter", 12),
+        ],
+    )
+    upsert_markets(
+        con,
+        [
+            MarketRecord(
+                market_slug="will-trump-be-republican-nominee",
+                event_slug="trump-nominee",
+                question="Will Trump be the Republican nominee?",
+                category="Politics",
+                tags=["Politics", "Trump"],
+                end_time=(now + timedelta(days=60)).isoformat(),
+                resolution_source=None,
+                clob_token_ids=["yes-token"],
+                liquidity=100_000,
+                raw={},
+            )
+        ],
+    )
+    insert_market_tick(con, (now - timedelta(hours=25)).isoformat(), "will-trump-be-republican-nominee", "yes-token", 0.29, 0.31, None, 100_000, {})
+    insert_market_tick(con, (now - timedelta(hours=1)).isoformat(), "will-trump-be-republican-nominee", "yes-token", 0.36, 0.38, None, 100_000, {})
+
+    rows = rank_accounts(con, "30d", KEYWORDS)
+    account = {row["account"]: row for row in rows}["FastCryptoCurator"]
+    matched = con.execute("select market_slug, narrative_key, entity, confidence from account_market_mentions").fetchall()
+
+    assert len(matched) == 1
+    assert matched[0][:3] == ("will-trump-be-republican-nominee", "market:will-trump-be-republican-nominee", "nominee")
+    assert round(matched[0][3], 2) == 0.83
+    assert account["sample_size"] == 1
+    assert account["market_impact_score"] > 0
 
 
 def test_sync_accounts_without_x_token_uses_fallback_warning(tmp_path, monkeypatch) -> None:

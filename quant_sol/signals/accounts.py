@@ -12,13 +12,15 @@ import duckdb
 from .config import Web3AccountConfig, Web3NarrativeKeywords, load_web3_accounts, load_web3_keywords, parse_duration
 from .storage import (
     upsert_account_impact_metrics,
+    upsert_account_market_mentions,
+    upsert_account_market_outcomes,
     upsert_account_narrative_mentions,
     upsert_account_source_chains,
     upsert_x_accounts,
     upsert_x_follow_graph,
     upsert_x_posts,
 )
-from .utils import to_datetime, utc_now_iso
+from .utils import to_datetime, utc_now_iso, words
 
 
 def account_rows_from_config(accounts: Sequence[Web3AccountConfig]) -> List[dict]:
@@ -75,11 +77,19 @@ def rank_accounts(
     accounts = _accounts(con)
     posts = _posts(con, since)
     ticks = _market_ticks(con, since)
-    mentions = _build_mentions(posts, keyword_config)
+    markets = _markets(con)
+    keyword_mentions = _build_mentions(posts, keyword_config)
+    direct_market_mentions = _direct_market_mentions(posts, markets)
+    mentions = _dedupe_mentions(keyword_mentions + _mentions_from_market_mentions(direct_market_mentions))
     mention_rows = _mention_rows(mentions)
     chains = _source_chains(mentions, con)
-    metrics = _impact_metrics(accounts, mentions, chains, ticks, lookback, keyword_config)
+    market_mentions = _dedupe_market_mentions(_market_mentions(keyword_mentions, markets, keyword_config) + direct_market_mentions)
+    outcomes = _market_outcomes(market_mentions, ticks)
+    metrics = _impact_metrics(accounts, mentions, chains, market_mentions, outcomes, lookback, keyword_config)
+    _clear_account_analysis_outputs(con)
     upsert_account_narrative_mentions(con, mention_rows)
+    upsert_account_market_mentions(con, market_mentions)
+    upsert_account_market_outcomes(con, outcomes)
     upsert_account_source_chains(con, chains)
     upsert_account_impact_metrics(con, metrics)
     return sorted(metrics, key=lambda item: item["final_score"], reverse=True)
@@ -91,19 +101,34 @@ def write_account_report(con: duckdb.DuckDBPyConnection, lookback: str, report_r
     chains = _latest_source_chains(con)
     path = report_root / f"account_rankings_{lookback}.md"
     lines = [
-        f"# Web3 X Account Ranking ({lookback})",
+        f"# Signal Account Ranking ({lookback})",
+        "",
+        "## Alpha Candidates",
         "",
         "| Rank | Account | Final | Speed | Freq | Cascade | Market | Chain | False FOMO | Status |",
         "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
-    if not rows:
+    alpha_rows = [
+        row for row in rows
+        if row["recommended_status"] not in {"confirmation_source", "insufficient_market_data", "insufficient_x_data"}
+    ]
+    if not alpha_rows:
         lines.append("| n/a | No account metrics | 0 | 0 | 0 | 0 | 0 | 0 | 0 | n/a |")
-    for idx, row in enumerate(rows, start=1):
+    for idx, row in enumerate(alpha_rows, start=1):
         lines.append(
             f"| {idx} | @{row['account']} | {_fmt(row['final_score'])} | {_fmt(row['speed_score'])} | "
             f"{_fmt(row['frequency_score'])} | {_fmt(row['cascade_score'])} | {_fmt(row['market_impact_score'])} | "
             f"{_fmt(row['source_chain_score'])} | {_fmt(row['false_fomo_rate'])} | {row['recommended_status']} |"
         )
+    lines.extend(["", "## Confirmation / Discovery Sources", ""])
+    for row in [item for item in rows if item["recommended_status"] == "confirmation_source"]:
+        lines.append(f"- @{row['account']}: confirmation/discovery source, excluded from alpha score.")
+    lines.extend(["", "## Insufficient Market Data", ""])
+    for row in [item for item in rows if item["recommended_status"] == "insufficient_market_data"]:
+        lines.append(f"- @{row['account']}: needs matched Polymarket ticks before alpha ranking.")
+    lines.extend(["", "## Insufficient X Data", ""])
+    for row in [item for item in rows if item["recommended_status"] == "insufficient_x_data"]:
+        lines.append(f"- @{row['account']}: no matched market/narrative posts in the lookback window.")
     lines.extend(["", "## Source Chain Candidates", ""])
     if not chains:
         lines.append("- None.")
@@ -145,11 +170,21 @@ def match_web3_narratives(text: str, keywords: Web3NarrativeKeywords) -> List[st
     return matched
 
 
+def match_web3_terms(text: str, keywords: Web3NarrativeKeywords) -> Mapping[str, Tuple[str, ...]]:
+    lowered = text.lower()
+    matches = {}
+    for group, terms in keywords.groups.items():
+        group_matches = tuple(term for term in terms if term.lower() in lowered)
+        if group_matches:
+            matches[group] = group_matches
+    return matches
+
+
 def _build_mentions(posts: Sequence[dict], keywords: Web3NarrativeKeywords) -> List[dict]:
     mentions = []
     for post in posts:
-        narratives = match_web3_narratives(str(post.get("text") or ""), keywords)
-        for narrative in narratives:
+        term_matches = match_web3_terms(str(post.get("text") or ""), keywords)
+        for narrative, terms in term_matches.items():
             mentions.append(
                 {
                     "account": post["handle"],
@@ -157,9 +192,94 @@ def _build_mentions(posts: Sequence[dict], keywords: Web3NarrativeKeywords) -> L
                     "post_id": post["post_id"],
                     "created_at": post["created_at"],
                     "public_metrics": post.get("public_metrics") or {},
+                    "text": post.get("text") or "",
+                    "entities": _entities_from_terms(terms),
+                    "direction": _direction_from_text(post.get("text") or ""),
                 }
             )
     return mentions
+
+
+def _direct_market_mentions(posts: Sequence[dict], markets: Sequence[dict]) -> List[dict]:
+    linked = []
+    for post in posts:
+        post_id = str(post.get("post_id") or "")
+        post_text = str(post.get("text") or "")
+        if not post_id or not post_text:
+            continue
+        post_terms = words(post_text)
+        for market in markets:
+            market_terms = _market_terms(market)
+            overlap = sorted((post_terms & market_terms) - _GENERIC_MARKET_TERMS)
+            if not overlap:
+                continue
+            strong = [term for term in overlap if term in _strong_terms(market)]
+            if len(overlap) < 2 and not strong:
+                continue
+            confidence = min(0.95, 0.55 + len(overlap) * 0.08 + (0.12 if strong else 0))
+            entity = strong[0] if strong else overlap[0]
+            linked.append(
+                {
+                    "account": str(post.get("handle") or "").lstrip("@"),
+                    "post_id": post_id,
+                    "market_slug": market["market_slug"],
+                    "narrative_key": f"market:{market['market_slug']}",
+                    "entity": entity,
+                    "confidence": confidence,
+                    "direction": _direction_from_text(post_text),
+                    "post_created_at": post.get("created_at"),
+                }
+            )
+    return linked
+
+
+def _mentions_from_market_mentions(market_mentions: Sequence[dict]) -> List[dict]:
+    mentions = []
+    for item in market_mentions:
+        mentions.append(
+            {
+                "account": item["account"],
+                "narrative_key": item["narrative_key"],
+                "post_id": item["post_id"],
+                "created_at": item["post_created_at"],
+                "public_metrics": {},
+                "text": "",
+                "entities": [item.get("entity")] if item.get("entity") else [],
+                "direction": item.get("direction") or "watch_only",
+            }
+        )
+    return mentions
+
+
+def _dedupe_mentions(mentions: Sequence[dict]) -> List[dict]:
+    seen = set()
+    result = []
+    for mention in mentions:
+        key = (mention.get("account"), mention.get("post_id"), mention.get("narrative_key"))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(mention)
+    return result
+
+
+def _dedupe_market_mentions(market_mentions: Sequence[dict]) -> List[dict]:
+    seen = set()
+    result = []
+    for mention in sorted(market_mentions, key=lambda item: float(item.get("confidence") or 0), reverse=True):
+        key = (mention.get("post_id"), mention.get("market_slug"), mention.get("narrative_key"), mention.get("entity") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(mention)
+    return result
+
+
+def _clear_account_analysis_outputs(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute("delete from account_narrative_mentions")
+    con.execute("delete from account_market_mentions")
+    con.execute("delete from account_market_outcomes")
+    con.execute("delete from account_source_chains")
 
 
 def _mention_rows(mentions: Sequence[dict]) -> List[dict]:
@@ -182,7 +302,8 @@ def _impact_metrics(
     accounts: Mapping[str, dict],
     mentions: Sequence[dict],
     chains: Sequence[dict],
-    ticks: Sequence[dict],
+    market_mentions: Sequence[dict],
+    outcomes: Sequence[dict],
     lookback: str,
     keywords: Web3NarrativeKeywords,
 ) -> List[dict]:
@@ -194,28 +315,38 @@ def _impact_metrics(
 
     speed = _speed_scores(by_narrative)
     cascade = _cascade_scores(by_narrative)
-    market = _market_impact_scores(by_account, ticks)
+    market = _market_impact_scores(outcomes)
+    outcome_stats = _outcome_stats(outcomes)
+    linked_counts = Counter(row["account"] for row in market_mentions if float(row.get("confidence") or 0) >= 0.6)
     chain_score = Counter()
     for chain in chains:
-        chain_score[chain["upstream_account"]] += float(chain.get("confidence") or 0) * 20
+        multiplier = 20 if chain.get("evidence_type") == "following_lead" else 4
+        chain_score[chain["upstream_account"]] += float(chain.get("confidence") or 0) * multiplier
     rows = []
     for account, profile in accounts.items():
         account_mentions = by_account.get(account, [])
+        role = profile.get("role") or "fast_curators"
+        stats = outcome_stats.get(account, {})
+        sample_size = int(stats.get("sample_size") or 0)
+        market_link_coverage = linked_counts.get(account, 0) / max(1, len(account_mentions))
         frequency_score = min(20.0, len(account_mentions) * 2.5)
         if _single_account_spam(account, by_narrative):
             frequency_score = min(frequency_score, 8.0)
-        false_fomo_rate = _false_fomo_rate(account_mentions, market.get(account, 0.0))
-        role = profile.get("role") or "fast_curators"
+        false_fomo_rate = float(stats.get("false_fomo_rate") or 0)
         role_weight = keywords.role_weights.get(role, 10)
-        final_score = (
-            speed.get(account, 0.0) * 0.28
-            + frequency_score * 0.16
-            + cascade.get(account, 0.0) * 0.18
-            + market.get(account, 0.0) * 0.18
-            + min(20.0, chain_score.get(account, 0.0)) * 0.15
-            + role_weight * 0.05
-            - false_fomo_rate * 12
-        )
+        if role == "confirmation_sources":
+            final_score = 0.0
+        else:
+            final_score = (
+                speed.get(account, 0.0) * 0.20
+                + frequency_score * 0.12
+                + cascade.get(account, 0.0) * 0.14
+                + market.get(account, 0.0) * 0.34
+                + min(20.0, chain_score.get(account, 0.0)) * 0.12
+                + role_weight * 0.04
+                + min(10.0, market_link_coverage * 10) * 0.04
+                - false_fomo_rate * 12
+            )
         rows.append(
             {
                 "account": account,
@@ -227,7 +358,14 @@ def _impact_metrics(
                 "source_chain_score": round(min(20.0, chain_score.get(account, 0.0)), 4),
                 "false_fomo_rate": round(false_fomo_rate, 4),
                 "final_score": round(max(0.0, min(100.0, final_score)), 4),
-                "recommended_status": _recommended_status(final_score, false_fomo_rate, len(account_mentions)),
+                "recommended_status": _recommended_status(role, final_score, false_fomo_rate, len(account_mentions), sample_size),
+                "sample_size": sample_size,
+                "market_link_coverage": round(market_link_coverage, 4),
+                "hit_rate_6h": stats.get("hit_rate_6h"),
+                "hit_rate_24h": stats.get("hit_rate_24h"),
+                "hit_rate_72h": stats.get("hit_rate_72h"),
+                "avg_favorable_move": stats.get("avg_favorable_move"),
+                "avg_adverse_move": stats.get("avg_adverse_move"),
             }
         )
     return rows
@@ -280,28 +418,20 @@ def _cascade_scores(by_narrative: Mapping[str, Sequence[dict]]) -> Counter:
     return _cap_counter(scores, 20)
 
 
-def _market_impact_scores(by_account: Mapping[str, Sequence[dict]], ticks: Sequence[dict]) -> Counter:
+def _market_impact_scores(outcomes: Sequence[dict]) -> Counter:
     scores = Counter()
-    if not ticks:
+    if not outcomes:
         return scores
-    sorted_ticks = sorted(ticks, key=lambda item: item["observed_at"])
-    for account, mentions in by_account.items():
-        favorable = 0
-        total = 0
-        for mention in mentions:
-            ts = to_datetime(mention["created_at"])
-            if ts is None:
-                continue
-            before = _nearest_tick(sorted_ticks, ts, before=True)
-            after = _nearest_tick(sorted_ticks, ts + timedelta(hours=24), before=True)
-            if before is None or after is None:
-                continue
-            total += 1
-            move = float(after["mid"]) - float(before["mid"])
-            if abs(move) >= 0.03:
-                favorable += 1
-        if total:
-            scores[account] = min(20, 20 * favorable / total)
+    by_account = defaultdict(list)
+    for outcome in outcomes:
+        if outcome.get("horizon") == "24h":
+            by_account[outcome["account"]].append(outcome)
+    for account, rows in by_account.items():
+        if not rows:
+            continue
+        positives = sum(1 for row in rows if row.get("is_positive"))
+        avg_favorable = sum(float(row.get("max_favorable_delta") or 0) for row in rows) / len(rows)
+        scores[account] = min(20, 12 * positives / len(rows) + min(8, avg_favorable * 100))
     return scores
 
 
@@ -341,23 +471,149 @@ def _source_chains(mentions: Sequence[dict], con: duckdb.DuckDBPyConnection) -> 
                 )
                 current["lead_time_minutes"] = min(current["lead_time_minutes"], lead)
                 current["shared_narratives"].add(narrative)
-                current["confidence"] += 0.25 if evidence == "following_lead" else 0.12
+                current["confidence"] += 0.25 if evidence == "following_lead" else 0.04
     chains = []
     for item in chain_map.values():
+        cap = 1.0 if item["evidence_type"] == "following_lead" else 0.35
         chains.append(
             {
                 **item,
                 "shared_narratives": sorted(item["shared_narratives"]),
-                "confidence": min(1.0, item["confidence"]),
+                "confidence": min(cap, item["confidence"]),
             }
         )
     return sorted(chains, key=lambda item: item["confidence"], reverse=True)
+
+
+def _market_mentions(mentions: Sequence[dict], markets: Sequence[dict], keywords: Web3NarrativeKeywords) -> List[dict]:
+    linked = []
+    for mention in mentions:
+        entities = mention.get("entities") or []
+        for market in markets:
+            market_text = _market_haystack(market)
+            entity_hits = [entity for entity in entities if entity and entity.lower() in market_text]
+            if entity_hits:
+                confidence = 0.9
+            else:
+                group_terms = keywords.groups.get(mention["narrative_key"], ())
+                confidence = 0.5 if any(term.lower() in market_text for term in group_terms) else 0.0
+            if confidence < 0.45:
+                continue
+            linked.append(
+                {
+                    "account": mention["account"],
+                    "post_id": mention["post_id"],
+                    "market_slug": market["market_slug"],
+                    "narrative_key": mention["narrative_key"],
+                    "entity": entity_hits[0] if entity_hits else mention["narrative_key"],
+                    "confidence": confidence,
+                    "direction": mention.get("direction") or "watch_only",
+                    "post_created_at": mention["created_at"],
+                }
+            )
+    return linked
+
+
+def _market_outcomes(market_mentions: Sequence[dict], ticks: Sequence[dict]) -> List[dict]:
+    if not market_mentions or not ticks:
+        return []
+    ticks_by_market = defaultdict(list)
+    for tick in sorted(ticks, key=lambda item: item["observed_at"]):
+        if tick.get("market_slug") and tick.get("mid") is not None:
+            ticks_by_market[tick["market_slug"]].append(tick)
+    outcomes = []
+    seen = set()
+    for mention in market_mentions:
+        if float(mention.get("confidence") or 0) < 0.6:
+            continue
+        created_at = to_datetime(mention.get("post_created_at"))
+        if created_at is None:
+            continue
+        market_ticks = ticks_by_market.get(mention["market_slug"], [])
+        entry = _nearest_tick(market_ticks, created_at, before=True)
+        if entry is None:
+            continue
+        entry_mid = float(entry["mid"])
+        direction_sign = _direction_sign(mention.get("direction"))
+        for horizon, hours in (("6h", 6), ("24h", 24), ("72h", 72)):
+            key = (mention["post_id"], mention["market_slug"], horizon)
+            if key in seen:
+                continue
+            seen.add(key)
+            end_at = created_at + timedelta(hours=hours)
+            window_ticks = [
+                tick for tick in market_ticks
+                if to_datetime(tick["observed_at"]) is not None and created_at <= to_datetime(tick["observed_at"]) <= end_at
+            ]
+            if not window_ticks:
+                continue
+            future_mid = float(window_ticks[-1]["mid"])
+            signed_moves = [(float(tick["mid"]) - entry_mid) * direction_sign for tick in window_ticks]
+            if direction_sign == 0:
+                signed_moves = [abs(float(tick["mid"]) - entry_mid) for tick in window_ticks]
+                delta = abs(future_mid - entry_mid)
+            else:
+                delta = (future_mid - entry_mid) * direction_sign
+            outcomes.append(
+                {
+                    "account": mention["account"],
+                    "post_id": mention["post_id"],
+                    "market_slug": mention["market_slug"],
+                    "horizon": horizon,
+                    "entry_mid": entry_mid,
+                    "future_mid": future_mid,
+                    "delta": delta,
+                    "max_favorable_delta": max(signed_moves),
+                    "max_adverse_delta": min(signed_moves),
+                    "is_positive": delta >= 0.03 or max(signed_moves) >= 0.03,
+                }
+            )
+    return outcomes
+
+
+def _outcome_stats(outcomes: Sequence[dict]) -> Mapping[str, dict]:
+    grouped = defaultdict(list)
+    for outcome in outcomes:
+        grouped[outcome["account"]].append(outcome)
+    stats = {}
+    for account, rows in grouped.items():
+        by_horizon = defaultdict(list)
+        for row in rows:
+            by_horizon[row["horizon"]].append(row)
+        all_rows = by_horizon.get("24h") or rows
+        positives = sum(1 for row in all_rows if row.get("is_positive"))
+        stats[account] = {
+            "sample_size": len(all_rows),
+            "false_fomo_rate": 1 - positives / len(all_rows) if all_rows else 0,
+            "hit_rate_6h": _hit_rate(by_horizon.get("6h", [])),
+            "hit_rate_24h": _hit_rate(by_horizon.get("24h", [])),
+            "hit_rate_72h": _hit_rate(by_horizon.get("72h", [])),
+            "avg_favorable_move": _avg(row.get("max_favorable_delta") for row in all_rows),
+            "avg_adverse_move": _avg(row.get("max_adverse_delta") for row in all_rows),
+        }
+    return stats
 
 
 def _accounts(con: duckdb.DuckDBPyConnection) -> Mapping[str, dict]:
     rows = con.execute("select handle, language, role, region, priority, followers, following from x_accounts").fetchall()
     columns = [desc[0] for desc in con.description]
     return {row[0]: dict(zip(columns, row)) for row in rows}
+
+
+def _markets(con: duckdb.DuckDBPyConnection) -> List[dict]:
+    rows = con.execute(
+        """
+        select market_slug, event_slug, question, category, tags, end_time, liquidity
+        from markets
+        """
+    ).fetchall()
+    columns = [desc[0] for desc in con.description]
+    result = []
+    for row in rows:
+        item = dict(zip(columns, row))
+        item["tags"] = _loads(item.get("tags"), [])
+        result.append(item)
+    return result
 
 
 def _posts(con: duckdb.DuckDBPyConnection, since_iso: str) -> List[dict]:
@@ -453,9 +709,13 @@ def _single_account_spam(account: str, by_narrative: Mapping[str, Sequence[dict]
     return False
 
 
-def _recommended_status(final_score: float, false_fomo_rate: float, mention_count: int) -> str:
+def _recommended_status(role: str, final_score: float, false_fomo_rate: float, mention_count: int, sample_size: int) -> str:
+    if role == "confirmation_sources":
+        return "confirmation_source"
     if mention_count == 0:
-        return "watch"
+        return "insufficient_x_data"
+    if sample_size == 0:
+        return "insufficient_market_data"
     if false_fomo_rate >= 0.6:
         return "rejected"
     if final_score >= 18:
@@ -463,6 +723,197 @@ def _recommended_status(final_score: float, false_fomo_rate: float, mention_coun
     if final_score >= 8:
         return "watch"
     return "noise_or_late"
+
+
+def _entities_from_terms(terms: Sequence[str]) -> List[str]:
+    generic = {
+        "listing",
+        "listed",
+        "airdrop",
+        "points",
+        "claim",
+        "eligibility",
+        "regulation",
+        "approval",
+        "enforcement",
+        "hack",
+        "exploit",
+        "stolen",
+        "drained",
+        "compromised",
+        "上线",
+        "上币",
+        "空投",
+        "积分",
+        "领取",
+        "资格",
+        "监管",
+        "批准",
+        "诉讼",
+        "执法",
+        "被盗",
+        "黑客",
+        "漏洞",
+        "攻击",
+        "被攻击",
+    }
+    return sorted({term for term in terms if term.lower() not in generic and len(term) >= 2})
+
+
+def _direction_from_text(text: str) -> str:
+    lowered = text.lower()
+    bullish = ("buy", "bought", "long", "pump", "rally", "surge", "accumulate", "流入", "买入", "做多", "反弹", "拉盘")
+    bearish = ("sell", "sold", "short", "dump", "hack", "exploit", "stolen", "drain", "被盗", "攻击", "做空", "卖出", "暴跌")
+    bull_hits = sum(1 for term in bullish if term in lowered)
+    bear_hits = sum(1 for term in bearish if term in lowered)
+    if bull_hits > bear_hits:
+        return "bullish"
+    if bear_hits > bull_hits:
+        return "bearish"
+    return "watch_only"
+
+
+def _direction_sign(direction: object) -> int:
+    if direction == "bullish":
+        return 1
+    if direction == "bearish":
+        return -1
+    return 0
+
+
+def _market_haystack(market: Mapping[str, object]) -> str:
+    tags = market.get("tags") or []
+    if not isinstance(tags, list):
+        tags = _loads(tags, [])
+    return " ".join(
+        [
+            str(market.get("market_slug") or ""),
+            str(market.get("event_slug") or ""),
+            str(market.get("question") or ""),
+            str(market.get("category") or ""),
+            " ".join(str(tag) for tag in tags),
+        ]
+    ).lower()
+
+
+def _market_terms(market: Mapping[str, object]) -> set:
+    return words(_market_haystack(market)) - _GENERIC_MARKET_TERMS
+
+
+def _strong_terms(market: Mapping[str, object]) -> set:
+    terms = _market_terms(market)
+    slug_terms = words(str(market.get("market_slug") or ""))
+    tag_terms = words(" ".join(str(tag) for tag in (market.get("tags") or [] if isinstance(market.get("tags"), list) else [])))
+    strong = {term for term in terms if term in slug_terms or term in tag_terms}
+    strong.update({term for term in terms if term.isupper() or any(char.isdigit() for char in term)})
+    return strong
+
+
+def _hit_rate(rows: Sequence[dict]) -> Optional[float]:
+    if not rows:
+        return None
+    return sum(1 for row in rows if row.get("is_positive")) / len(rows)
+
+
+def _avg(values: Iterable[object]) -> Optional[float]:
+    floats = []
+    for value in values:
+        if value is None:
+            continue
+        try:
+            floats.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    if not floats:
+        return None
+    return sum(floats) / len(floats)
+
+
+_GENERIC_MARKET_TERMS = {
+    "will",
+    "market",
+    "markets",
+    "prediction",
+    "predict",
+    "price",
+    "before",
+    "after",
+    "this",
+    "that",
+    "the",
+    "and",
+    "are",
+    "for",
+    "from",
+    "with",
+    "into",
+    "onto",
+    "about",
+    "after",
+    "before",
+    "during",
+    "across",
+    "still",
+    "just",
+    "has",
+    "have",
+    "had",
+    "was",
+    "were",
+    "been",
+    "being",
+    "his",
+    "her",
+    "their",
+    "its",
+    "you",
+    "your",
+    "they",
+    "them",
+    "who",
+    "what",
+    "when",
+    "where",
+    "why",
+    "how",
+    "all",
+    "new",
+    "old",
+    "full",
+    "more",
+    "most",
+    "less",
+    "than",
+    "then",
+    "now",
+    "ago",
+    "next",
+    "month",
+    "year",
+    "week",
+    "today",
+    "tomorrow",
+    "2025",
+    "2026",
+    "2027",
+    "2028",
+    "yes",
+    "not",
+    "hit",
+    "reach",
+    "above",
+    "below",
+    "over",
+    "under",
+    "open",
+    "close",
+    "closed",
+    "trade",
+    "trading",
+    "token",
+    "crypto",
+    "polymarket",
+}
 
 
 def _cap_counter(counter: Counter, cap: float) -> Counter:

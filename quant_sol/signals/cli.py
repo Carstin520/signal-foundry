@@ -20,7 +20,7 @@ from .accounts import (
     rank_accounts as rank_web3_accounts,
     write_account_report,
 )
-from .clients import CLOBWebSocket, DataApiClient, GammaMarketClient, XApiClient
+from .clients import CLOBClient, CLOBWebSocket, DataApiClient, GammaMarketClient, XApiClient
 from .config import (
     SIGNAL_REPORT_ROOT,
     load_fomo_config,
@@ -28,6 +28,7 @@ from .config import (
     load_social_handles,
     load_wallet_watchlist,
     load_web3_accounts,
+    load_web3_keywords,
     load_x_api_limits,
     parse_duration,
 )
@@ -39,6 +40,7 @@ from .storage import (
     api_calls_today,
     alerted_signal_ids,
     connect,
+    insert_market_midpoint_tick,
     insert_market_tick,
     record_api_call,
     record_telegram_alert,
@@ -62,13 +64,13 @@ load_local_env()
 
 @app.command("discover-markets")
 def discover_markets(
-    category: str = typer.Option("politics", "--category", help="Market category focus. V1 supports politics/geopolitics."),
+    category: str = typer.Option("politics", "--category", help="Market category focus: politics or crypto."),
     max_pages: int = typer.Option(3, "--max-pages", help="Gamma API pages to scan."),
 ) -> None:
-    """Discover active political/geopolitical Polymarket markets through Gamma."""
-    rules = load_market_rules()
+    """Discover active Polymarket markets through Gamma."""
+    keywords = _market_keywords_for_category(category)
     client = GammaMarketClient()
-    records = client.discover_political_markets(rules.keywords, max_pages=max_pages)
+    records = client.discover_markets(keywords, max_pages=max_pages, category=category)
     con = connect()
     count = upsert_markets(con, records)
     save_raw_payload("gamma_markets", category, [record.raw for record in records])
@@ -462,6 +464,37 @@ def stream_market(
     console.print(f"Streamed CLOB updates for {seconds}s from {len(token_to_market)} token(s).")
 
 
+@app.command("sync-market-ticks")
+def sync_market_ticks(
+    category: str = typer.Option("crypto", "--category", help="Market category filter: crypto, politics, or all."),
+    max_markets: int = typer.Option(20, "--max-markets", help="Maximum markets to snapshot."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Estimate token snapshots without calling CLOB."),
+) -> None:
+    """Snapshot public CLOB midpoint prices for discovered markets."""
+    con = connect()
+    markets = _markets_for_tick_sync(con, category, max_markets)
+    token_rows = []
+    for market in markets:
+        for token_id in _json_list(market.get("clob_token_ids"))[:1]:
+            token_rows.append((market["market_slug"], token_id, market.get("liquidity")))
+    console.print(f"Polymarket CLOB plan: markets={len(markets)}, token_midpoints={len(token_rows)}")
+    if dry_run:
+        console.print("Dry run only: no CLOB calls made.")
+        return
+    client = CLOBClient()
+    observed_at = utc_now_iso()
+    count = 0
+    for market_slug, token_id, liquidity in token_rows:
+        try:
+            mid = client.midpoint(token_id)
+        except RequestException as exc:
+            console.print(f"[yellow]warning: midpoint failed for {market_slug}/{token_id}: {exc}[/yellow]")
+            continue
+        insert_market_midpoint_tick(con, observed_at, market_slug, token_id, mid, liquidity, {"mid": mid, "token_id": token_id})
+        count += 1
+    console.print(f"Synced {count} CLOB midpoint tick(s).")
+
+
 @app.command("score")
 def score(
     since: str = typer.Option("24h", "--since", help="Score narrative windows since this duration."),
@@ -540,6 +573,38 @@ def _top_account_handles(con, limit: int) -> list[str]:
         [limit],
     ).fetchall()
     return [str(row[0]) for row in account_rows]
+
+
+def _market_keywords_for_category(category: str) -> list[str]:
+    if category in {"crypto", "web3"}:
+        keywords = load_web3_keywords()
+        terms = []
+        for group_terms in keywords.groups.values():
+            terms.extend(group_terms)
+        terms.extend(["crypto", "bitcoin", "ethereum", "solana", "binance", "coinbase", "hyperliquid"])
+        return list(dict.fromkeys(str(term).lower() for term in terms if term))
+    return list(load_market_rules().keywords)
+
+
+def _markets_for_tick_sync(con, category: str, max_markets: int) -> list[dict]:
+    markets = active_markets(con)
+    if category == "all":
+        return markets[:max_markets]
+    keywords = _market_keywords_for_category(category)
+    matched = []
+    for market in markets:
+        haystack = " ".join(
+            [
+                str(market.get("market_slug") or ""),
+                str(market.get("event_slug") or ""),
+                str(market.get("question") or ""),
+                str(market.get("category") or ""),
+                " ".join(_json_list(market.get("tags"))),
+            ]
+        ).lower()
+        if any(keyword in haystack for keyword in keywords):
+            matched.append(market)
+    return matched[:max_markets]
 
 
 def _check_x_budget(con, planned_calls: int, daily_cap: int, dry_run: bool, label: str) -> bool:

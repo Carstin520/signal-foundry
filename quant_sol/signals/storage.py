@@ -156,6 +156,13 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             false_fomo_rate double,
             final_score double,
             recommended_status varchar,
+            sample_size integer,
+            market_link_coverage double,
+            hit_rate_6h double,
+            hit_rate_24h double,
+            hit_rate_72h double,
+            avg_favorable_move double,
+            avg_adverse_move double,
             evaluated_at timestamp not null,
             primary key (account, lookback)
         )
@@ -171,6 +178,39 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             shared_narratives json,
             confidence double,
             primary key (downstream_account, upstream_account, evidence_type)
+        )
+        """
+    )
+    con.execute(
+        """
+        create table if not exists account_market_mentions (
+            account varchar not null,
+            post_id varchar not null,
+            market_slug varchar not null,
+            narrative_key varchar not null,
+            entity varchar not null,
+            confidence double,
+            direction varchar,
+            post_created_at timestamp,
+            primary key (post_id, market_slug, narrative_key, entity)
+        )
+        """
+    )
+    con.execute(
+        """
+        create table if not exists account_market_outcomes (
+            account varchar not null,
+            post_id varchar not null,
+            market_slug varchar not null,
+            horizon varchar not null,
+            entry_mid double,
+            future_mid double,
+            delta double,
+            max_favorable_delta double,
+            max_adverse_delta double,
+            is_positive boolean,
+            evaluated_at timestamp not null,
+            primary key (post_id, market_slug, horizon)
         )
         """
     )
@@ -280,6 +320,19 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    _ensure_columns(
+        con,
+        "account_impact_metrics",
+        {
+            "sample_size": "integer",
+            "market_link_coverage": "double",
+            "hit_rate_6h": "double",
+            "hit_rate_24h": "double",
+            "hit_rate_72h": "double",
+            "avg_favorable_move": "double",
+            "avg_adverse_move": "double",
+        },
+    )
 
 
 def save_raw_payload(namespace: str, label: str, payload: object, fetched_at: Optional[str] = None) -> Path:
@@ -376,6 +429,25 @@ def insert_market_tick(
         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [observed_at, market_slug, token_id, best_bid, best_ask, mid, spread, last_trade_price, liquidity, json.dumps(raw, ensure_ascii=False)],
+    )
+
+
+def insert_market_midpoint_tick(
+    con: duckdb.DuckDBPyConnection,
+    observed_at: str,
+    market_slug: Optional[str],
+    token_id: Optional[str],
+    mid: Optional[float],
+    liquidity: Optional[float],
+    raw: object,
+) -> None:
+    con.execute(
+        """
+        insert into market_ticks
+        (observed_at, market_slug, token_id, best_bid, best_ask, mid, spread, last_trade_price, liquidity, raw_json)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [observed_at, market_slug, token_id, None, None, mid, None, None, liquidity, json.dumps(raw, ensure_ascii=False)],
     )
 
 
@@ -570,6 +642,13 @@ def upsert_account_impact_metrics(con: duckdb.DuckDBPyConnection, metrics: Itera
             float(row.get("false_fomo_rate") or 0),
             float(row.get("final_score") or 0),
             row.get("recommended_status"),
+            int(row.get("sample_size") or 0),
+            float(row.get("market_link_coverage") or 0),
+            _float_or_none(row.get("hit_rate_6h")),
+            _float_or_none(row.get("hit_rate_24h")),
+            _float_or_none(row.get("hit_rate_72h")),
+            _float_or_none(row.get("avg_favorable_move")),
+            _float_or_none(row.get("avg_adverse_move")),
             evaluated_at,
         )
         for row in metrics
@@ -581,8 +660,10 @@ def upsert_account_impact_metrics(con: duckdb.DuckDBPyConnection, metrics: Itera
         """
         insert or replace into account_impact_metrics
         (account, lookback, speed_score, frequency_score, cascade_score, market_impact_score,
-         source_chain_score, false_fomo_rate, final_score, recommended_status, evaluated_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         source_chain_score, false_fomo_rate, final_score, recommended_status, sample_size,
+         market_link_coverage, hit_rate_6h, hit_rate_24h, hit_rate_72h, avg_favorable_move,
+         avg_adverse_move, evaluated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -609,6 +690,67 @@ def upsert_account_source_chains(con: duckdb.DuckDBPyConnection, chains: Iterabl
         insert or replace into account_source_chains
         (downstream_account, upstream_account, evidence_type, lead_time_minutes, shared_narratives, confidence)
         values (?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def upsert_account_market_mentions(con: duckdb.DuckDBPyConnection, mentions: Iterable[dict]) -> int:
+    rows = [
+        (
+            row["account"],
+            row["post_id"],
+            row["market_slug"],
+            row["narrative_key"],
+            row.get("entity") or "",
+            float(row.get("confidence") or 0),
+            row.get("direction"),
+            row.get("post_created_at"),
+        )
+        for row in mentions
+        if row.get("account") and row.get("post_id") and row.get("market_slug") and row.get("narrative_key")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into account_market_mentions
+        (account, post_id, market_slug, narrative_key, entity, confidence, direction, post_created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def upsert_account_market_outcomes(con: duckdb.DuckDBPyConnection, outcomes: Iterable[dict], evaluated_at: Optional[str] = None) -> int:
+    evaluated_at = evaluated_at or utc_now_iso()
+    rows = [
+        (
+            row["account"],
+            row["post_id"],
+            row["market_slug"],
+            row["horizon"],
+            _float_or_none(row.get("entry_mid")),
+            _float_or_none(row.get("future_mid")),
+            _float_or_none(row.get("delta")),
+            _float_or_none(row.get("max_favorable_delta")),
+            _float_or_none(row.get("max_adverse_delta")),
+            bool(row.get("is_positive")),
+            evaluated_at,
+        )
+        for row in outcomes
+        if row.get("account") and row.get("post_id") and row.get("market_slug") and row.get("horizon")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into account_market_outcomes
+        (account, post_id, market_slug, horizon, entry_mid, future_mid, delta,
+         max_favorable_delta, max_adverse_delta, is_positive, evaluated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -865,6 +1007,15 @@ def _int_or_none(value: object) -> Optional[int]:
         return None
 
 
+def _float_or_none(value: object) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _bool_or_none(value: object) -> Optional[bool]:
     if value is None or value == "":
         return None
@@ -876,3 +1027,13 @@ def _bool_or_none(value: object) -> Optional[bool]:
     if text in {"0", "false", "no", "n"}:
         return False
     return None
+
+
+def _ensure_columns(con: duckdb.DuckDBPyConnection, table: str, columns: dict) -> None:
+    existing = {
+        str(row[1])
+        for row in con.execute(f"pragma table_info('{table}')").fetchall()
+    }
+    for name, ddl in columns.items():
+        if name not in existing:
+            con.execute(f"alter table {table} add column {name} {ddl}")

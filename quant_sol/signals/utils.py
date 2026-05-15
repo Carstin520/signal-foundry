@@ -37,7 +37,8 @@ def to_datetime(value: object) -> Optional[datetime]:
     if text is None:
         return None
     try:
-        return datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     except ValueError:
         return None
 

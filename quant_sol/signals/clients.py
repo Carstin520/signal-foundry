@@ -41,13 +41,16 @@ class GammaMarketClient:
         return markets
 
     def discover_political_markets(self, keywords: Sequence[str], max_pages: int = 3) -> List[MarketRecord]:
+        return self.discover_markets(keywords, max_pages=max_pages, category="politics")
+
+    def discover_markets(self, keywords: Sequence[str], max_pages: int = 3, category: str = "crypto") -> List[MarketRecord]:
         records: List[MarketRecord] = []
         seen: set = set()
         for item in self.list_markets(max_pages=max_pages):
             record = market_record_from_gamma(item)
             if not record.market_slug or record.market_slug in seen:
                 continue
-            if is_political_market(record, keywords):
+            if is_market_match(record, keywords, category):
                 records.append(record)
                 seen.add(record.market_slug)
         return records
@@ -320,6 +323,44 @@ def is_political_market(market: MarketRecord, keywords: Sequence[str]) -> bool:
         "fed",
     }
     return any(marker in haystack for marker in political_markers) or any(keyword in haystack for keyword in keywords)
+
+
+def is_crypto_market(market: MarketRecord, keywords: Sequence[str]) -> bool:
+    haystack = " ".join([market.question, market.market_slug, market.event_slug or "", market.category or "", " ".join(market.tags)]).lower()
+    crypto_markers = {
+        "bitcoin",
+        "btc",
+        "ethereum",
+        "eth",
+        "solana",
+        "sol",
+        "crypto",
+        "binance",
+        "coinbase",
+        "hype",
+        "hyperliquid",
+        "base",
+        "airdrop",
+        "token",
+        "stablecoin",
+        "memecoin",
+        "meme",
+        "etf",
+        "sec",
+        "hack",
+        "exploit",
+    }
+    lowered_keywords = {str(keyword).lower() for keyword in keywords}
+    return any(marker in haystack for marker in crypto_markers) or any(keyword in haystack for keyword in lowered_keywords)
+
+
+def is_market_match(market: MarketRecord, keywords: Sequence[str], category: str) -> bool:
+    if category == "politics":
+        return is_political_market(market, keywords)
+    if category in {"crypto", "web3"}:
+        return is_crypto_market(market, keywords)
+    haystack = " ".join([market.question, market.market_slug, market.event_slug or "", market.category or "", " ".join(market.tags)]).lower()
+    return any(str(keyword).lower() in haystack for keyword in keywords)
 
 
 def _coerce_rows(payload: object) -> List[dict]:
