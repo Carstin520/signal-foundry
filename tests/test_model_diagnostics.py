@@ -131,3 +131,65 @@ def test_collect_market_ticks_dry_run_is_bounded(tmp_path, monkeypatch) -> None:
     assert result.exit_code == 0
     assert "planned_calls=3" in result.stdout
     assert "Dry run only" in result.stdout
+
+
+def test_collect_market_ticks_can_target_event_case(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    con = connect(tmp_path / "data" / "quant_sol.duckdb")
+    upsert_markets(
+        con,
+        [
+            MarketRecord(
+                market_slug="trump-china",
+                event_slug="trump-china",
+                question="Will Trump visit China?",
+                category="Politics",
+                tags=["Politics"],
+                end_time="2026-06-01T00:00:00+00:00",
+                resolution_source=None,
+                clob_token_ids=["yes-token", "no-token"],
+                liquidity=50_000,
+                raw={},
+            ),
+            MarketRecord(
+                market_slug="other-market",
+                event_slug="other",
+                question="Other market",
+                category="Politics",
+                tags=["Politics"],
+                end_time="2026-06-01T00:00:00+00:00",
+                resolution_source=None,
+                clob_token_ids=["other-token"],
+                liquidity=50_000,
+                raw={},
+            ),
+        ],
+    )
+    con.execute(
+        """
+        insert into event_cases
+        (case_id, query, market_slug, start_at, end_at, keywords, status, created_at, updated_at)
+        values ('trump_china', 'Trump China visit', 'trump-china',
+                '2026-05-01T00:00:00+00:00', '2026-06-01T00:00:00+00:00',
+                '[]', 'active', current_timestamp, current_timestamp)
+        """
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "collect-market-ticks",
+            "--case",
+            "trump_china",
+            "--iterations",
+            "4",
+            "--interval-seconds",
+            "0",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "case=trump_china" in result.stdout
+    assert "markets=1" in result.stdout
+    assert "planned_calls=4" in result.stdout

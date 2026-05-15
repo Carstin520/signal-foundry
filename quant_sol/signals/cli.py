@@ -512,6 +512,7 @@ def backfill_x_history(
     daily_cap: Optional[int] = typer.Option(None, "--daily-cap", help="Local daily X API call cap."),
     max_accounts: Optional[int] = typer.Option(None, "--max-accounts", help="Maximum signal accounts to query."),
     max_posts_per_account: int = typer.Option(25, "--max-posts-per-account", help="Maximum posts requested per account."),
+    handles: Optional[str] = typer.Option(None, "--handles", help="Comma-separated X handles to query instead of configured Web3 accounts."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Estimate X calls without contacting X API."),
 ) -> None:
     """Backfill X posts for an event case using official X full-archive API."""
@@ -527,7 +528,7 @@ def backfill_x_history(
     if not token:
         console.print("[yellow]X_BEARER_TOKEN is not set. Cannot use X full-archive search.[/yellow]")
         return
-    accounts = load_web3_accounts()
+    accounts = _ad_hoc_accounts(handles) if handles else load_web3_accounts()
     selected = accounts[: max_accounts or load_x_api_limits().sync_accounts_max_accounts]
     planned_calls = len(selected) * 2
     cap = daily_cap or load_x_api_limits().daily_call_cap
@@ -537,7 +538,14 @@ def backfill_x_history(
         return
 
     client = XApiClient(token)
-    keywords = case_row.get("keywords") or case_keywords(str(case_row.get("query") or ""))
+    keywords = list(
+        dict.fromkeys(
+            [
+                *(case_row.get("keywords") or []),
+                *case_keywords(str(case_row.get("query") or "")),
+            ]
+        )
+    )
     start_time = x_time(case_row["start_at"])
     end_time = x_time(case_row["end_at"])
     total = 0
@@ -568,11 +576,15 @@ def backfill_x_history(
 def run_event_backtest(
     case: str = typer.Option(..., "--case", help="Historical event case id."),
     horizons: str = typer.Option("1h,6h,24h,72h", "--horizons", help="Comma-separated horizons."),
+    mode: str = typer.Option("ramp", "--mode", help="Backtest mode: ramp, volatility, or event."),
 ) -> None:
     """Run post-level event-study backtest for an event case."""
+    if mode not in {"ramp", "volatility", "event"}:
+        console.print(f"[yellow]Unsupported mode '{mode}'. Use ramp, volatility, or event.[/yellow]")
+        return
     horizon_values = [part.strip() for part in horizons.split(",") if part.strip()]
-    impacts, metrics = run_event_backtest_case(connect(), case, horizon_values)
-    console.print(f"Backtested {len(impacts)} post impact row(s); wrote {len(metrics)} account metric row(s).")
+    impacts, metrics = run_event_backtest_case(connect(), case, horizon_values, mode=mode)
+    console.print(f"Backtested {len(impacts)} {mode} post impact row(s); wrote {len(metrics)} account metric row(s).")
 
 
 @app.command("report-event-backtest")
@@ -653,13 +665,15 @@ def stream_market(
 @app.command("sync-market-ticks")
 def sync_market_ticks(
     category: str = typer.Option("crypto", "--category", help="Market category filter: crypto, politics, or all."),
+    case: Optional[str] = typer.Option(None, "--case", help="Historical event case id. Overrides category/max-markets."),
     max_markets: int = typer.Option(20, "--max-markets", help="Maximum markets to snapshot."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Estimate token snapshots without calling CLOB."),
 ) -> None:
     """Snapshot public CLOB midpoint prices for discovered markets."""
     con = connect()
-    markets, token_rows = _market_tick_plan(con, category, max_markets)
-    console.print(f"Polymarket CLOB plan: markets={len(markets)}, token_midpoints={len(token_rows)}")
+    markets, token_rows = _market_tick_plan(con, category, max_markets, case=case)
+    scope = f"case={case}" if case else f"category={category}"
+    console.print(f"Polymarket CLOB plan: {scope}, markets={len(markets)}, token_midpoints={len(token_rows)}")
     if dry_run:
         console.print("Dry run only: no CLOB calls made.")
         return
@@ -670,6 +684,7 @@ def sync_market_ticks(
 @app.command("collect-market-ticks")
 def collect_market_ticks(
     category: str = typer.Option("all", "--category", help="Market category filter: crypto, politics, or all."),
+    case: Optional[str] = typer.Option(None, "--case", help="Historical event case id. Overrides category/max-markets."),
     max_markets: int = typer.Option(20, "--max-markets", help="Maximum markets to snapshot per iteration."),
     interval_seconds: int = typer.Option(300, "--interval-seconds", help="Seconds between midpoint snapshots."),
     iterations: int = typer.Option(12, "--iterations", help="Number of snapshot iterations. Use a bounded value."),
@@ -677,10 +692,11 @@ def collect_market_ticks(
 ) -> None:
     """Continuously collect bounded Polymarket CLOB midpoint snapshots."""
     con = connect()
-    markets, token_rows = _market_tick_plan(con, category, max_markets)
+    markets, token_rows = _market_tick_plan(con, category, max_markets, case=case)
     planned_calls = len(token_rows) * max(0, iterations)
+    scope = f"case={case}" if case else f"category={category}"
     console.print(
-        f"Polymarket CLOB continuous plan: category={category}, markets={len(markets)}, "
+        f"Polymarket CLOB continuous plan: {scope}, markets={len(markets)}, "
         f"token_midpoints_per_iteration={len(token_rows)}, iterations={iterations}, "
         f"interval_seconds={interval_seconds}, planned_calls={planned_calls}"
     )
@@ -691,7 +707,7 @@ def collect_market_ticks(
         console.print("[yellow]interval-seconds must be non-negative.[/yellow]")
         return
     if not token_rows:
-        console.print("[yellow]No token ids found. Run discover-markets first.[/yellow]")
+        console.print("[yellow]No token ids found. Run discover-markets/discover-event-case first.[/yellow]")
         return
     if dry_run:
         console.print("Dry run only: no CLOB calls made.")
@@ -787,6 +803,19 @@ def _top_account_handles(con, limit: int) -> list[str]:
     return [str(row[0]) for row in account_rows]
 
 
+def _ad_hoc_accounts(handles: Optional[str]):
+    from .config import Web3AccountConfig
+
+    if not handles:
+        return []
+    accounts = []
+    for handle in handles.split(","):
+        normalized = handle.strip().lstrip("@")
+        if normalized:
+            accounts.append(Web3AccountConfig(normalized, "mixed", "global", "elite_information", "ad_hoc"))
+    return accounts
+
+
 def _market_keywords_for_category(category: str) -> list[str]:
     if category in {"crypto", "web3"}:
         keywords = load_web3_keywords()
@@ -819,13 +848,34 @@ def _markets_for_tick_sync(con, category: str, max_markets: int) -> list[dict]:
     return matched[:max_markets]
 
 
-def _market_tick_plan(con, category: str, max_markets: int):
-    markets = _markets_for_tick_sync(con, category, max_markets)
+def _market_tick_plan(con, category: str, max_markets: int, case: Optional[str] = None):
+    if case:
+        markets = _markets_for_case_tick_sync(con, case)
+    else:
+        markets = _markets_for_tick_sync(con, category, max_markets)
     token_rows = []
     for market in markets:
         for token_id in _json_list(market.get("clob_token_ids"))[:1]:
             token_rows.append((market["market_slug"], token_id, market.get("liquidity")))
     return markets, token_rows
+
+
+def _markets_for_case_tick_sync(con, case: str) -> list[dict]:
+    case_row = get_event_case(con, case)
+    if not case_row or not case_row.get("market_slug"):
+        return []
+    row = con.execute(
+        """
+        select market_slug, event_slug, question, category, tags, end_time, clob_token_ids, liquidity
+        from markets
+        where market_slug = ?
+        """,
+        [case_row["market_slug"]],
+    ).fetchone()
+    if not row:
+        return []
+    columns = [desc[0] for desc in con.description]
+    return [dict(zip(columns, row))]
 
 
 def _snapshot_market_ticks(con, token_rows) -> int:

@@ -350,14 +350,25 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             handle varchar not null,
             market_slug varchar not null,
             horizon varchar not null,
+            mode varchar,
             entry_mid double,
             future_mid double,
             delta double,
+            close_delta double,
             max_favorable_delta double,
             max_adverse_delta double,
+            entry_delay_seconds double,
+            price_in_time timestamp,
+            ramp_duration_minutes double,
             price_move_started_before_post boolean,
             is_positive boolean,
             is_strong boolean,
+            tradable_ramp boolean,
+            strong_ramp boolean,
+            already_hot_penalty boolean,
+            crowded_entry boolean,
+            late_stage_ramp boolean,
+            risk_tags json,
             evaluated_at timestamp not null,
             primary key (case_id, post_id, market_slug, horizon)
         )
@@ -373,6 +384,13 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             hit_rate double,
             false_fomo_rate double,
             sample_size integer,
+            ramp_hit_rate double,
+            strong_ramp_rate double,
+            avg_entry_delay_seconds double,
+            avg_max_favorable_delta double,
+            avg_max_adverse_delta double,
+            already_hot_rate double,
+            tradable_score double,
             recommended_status varchar,
             evaluated_at timestamp not null,
             primary key (account, case_id)
@@ -409,6 +427,36 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
         {
             "tick_source": "varchar",
             "ingested_at": "timestamp",
+        },
+    )
+    _ensure_columns(
+        con,
+        "event_post_impacts",
+        {
+            "mode": "varchar",
+            "close_delta": "double",
+            "entry_delay_seconds": "double",
+            "price_in_time": "timestamp",
+            "ramp_duration_minutes": "double",
+            "tradable_ramp": "boolean",
+            "strong_ramp": "boolean",
+            "already_hot_penalty": "boolean",
+            "crowded_entry": "boolean",
+            "late_stage_ramp": "boolean",
+            "risk_tags": "json",
+        },
+    )
+    _ensure_columns(
+        con,
+        "event_account_metrics",
+        {
+            "ramp_hit_rate": "double",
+            "strong_ramp_rate": "double",
+            "avg_entry_delay_seconds": "double",
+            "avg_max_favorable_delta": "double",
+            "avg_max_adverse_delta": "double",
+            "already_hot_rate": "double",
+            "tradable_score": "double",
         },
     )
 
@@ -1099,14 +1147,25 @@ def upsert_event_post_impacts(con: duckdb.DuckDBPyConnection, impacts: Iterable[
             str(row["handle"]).lstrip("@"),
             row["market_slug"],
             row["horizon"],
+            row.get("mode") or "event",
             _float_or_none(row.get("entry_mid")),
             _float_or_none(row.get("future_mid")),
             _float_or_none(row.get("delta")),
+            _float_or_none(row.get("close_delta")),
             _float_or_none(row.get("max_favorable_delta")),
             _float_or_none(row.get("max_adverse_delta")),
+            _float_or_none(row.get("entry_delay_seconds")),
+            row.get("price_in_time"),
+            _float_or_none(row.get("ramp_duration_minutes")),
             bool(row.get("price_move_started_before_post")),
             bool(row.get("is_positive")),
             bool(row.get("is_strong")),
+            bool(row.get("tradable_ramp")),
+            bool(row.get("strong_ramp")),
+            bool(row.get("already_hot_penalty")),
+            bool(row.get("crowded_entry")),
+            bool(row.get("late_stage_ramp")),
+            json.dumps(row.get("risk_tags") or [], ensure_ascii=False),
             evaluated_at,
         )
         for row in impacts
@@ -1117,10 +1176,12 @@ def upsert_event_post_impacts(con: duckdb.DuckDBPyConnection, impacts: Iterable[
     con.executemany(
         """
         insert or replace into event_post_impacts
-        (case_id, post_id, handle, market_slug, horizon, entry_mid, future_mid, delta,
-         max_favorable_delta, max_adverse_delta, price_move_started_before_post,
-         is_positive, is_strong, evaluated_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (case_id, post_id, handle, market_slug, horizon, mode, entry_mid, future_mid, delta,
+         close_delta, max_favorable_delta, max_adverse_delta, entry_delay_seconds,
+         price_in_time, ramp_duration_minutes, price_move_started_before_post,
+         is_positive, is_strong, tradable_ramp, strong_ramp, already_hot_penalty,
+         crowded_entry, late_stage_ramp, risk_tags, evaluated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -1138,6 +1199,13 @@ def upsert_event_account_metrics(con: duckdb.DuckDBPyConnection, metrics: Iterab
             _float_or_none(row.get("hit_rate")),
             _float_or_none(row.get("false_fomo_rate")),
             int(row.get("sample_size") or 0),
+            _float_or_none(row.get("ramp_hit_rate")),
+            _float_or_none(row.get("strong_ramp_rate")),
+            _float_or_none(row.get("avg_entry_delay_seconds")),
+            _float_or_none(row.get("avg_max_favorable_delta")),
+            _float_or_none(row.get("avg_max_adverse_delta")),
+            _float_or_none(row.get("already_hot_rate")),
+            _float_or_none(row.get("tradable_score")),
             row.get("recommended_status"),
             evaluated_at,
         )
@@ -1150,8 +1218,10 @@ def upsert_event_account_metrics(con: duckdb.DuckDBPyConnection, metrics: Iterab
         """
         insert or replace into event_account_metrics
         (account, case_id, lead_score, impact_score, hit_rate, false_fomo_rate,
-         sample_size, recommended_status, evaluated_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         sample_size, ramp_hit_rate, strong_ramp_rate, avg_entry_delay_seconds,
+         avg_max_favorable_delta, avg_max_adverse_delta, already_hot_rate,
+         tradable_score, recommended_status, evaluated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )

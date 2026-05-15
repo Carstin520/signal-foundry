@@ -6,10 +6,13 @@ from typer.testing import CliRunner
 from quant_sol.signals.cli import app
 from quant_sol.signals.config import Web3AccountConfig
 from quant_sol.signals.history import (
+    case_keywords,
     direction_from_text,
+    matched_keywords,
     normalize_price_history,
     run_event_backtest,
     store_event_case_posts,
+    x_case_query,
 )
 from quant_sol.signals.models import MarketRecord
 from quant_sol.signals.storage import (
@@ -39,6 +42,28 @@ def test_trump_china_direction_keywords_support_english_and_chinese() -> None:
     assert direction_from_text("Trump may visit Beijing for a Xi summit") == "bullish"
     assert direction_from_text("暂无计划，visit is unlikely and may be postponed") == "bearish"
     assert direction_from_text("Trump China discussion is noisy") == "watch_only"
+
+
+def test_trump_china_indirect_catalyst_matching_requires_anchor_and_impact() -> None:
+    keywords = case_keywords("Trump China visit")
+
+    matched = matched_keywords(
+        "White House says Iran nuclear situation remains unresolved before Trump Asia scheduling call",
+        keywords,
+    )
+
+    assert "indirect_catalyst" in matched
+    assert direction_from_text("Iran nuclear situation remains unresolved before Trump decision") == "bearish"
+    assert not matched_keywords("Iran nuclear talks continue without a scheduling impact", keywords)
+
+
+def test_trump_china_x_query_includes_indirect_catalysts() -> None:
+    query = x_case_query("lrozen", case_keywords("Trump China visit"))
+
+    assert "from:lrozen" in query
+    assert "iran" in query
+    assert "tariff" in query
+    assert '"white house"' in query
 
 
 def test_event_backtest_marks_early_source_and_late_price_follower(tmp_path) -> None:
@@ -107,7 +132,7 @@ def test_event_backtest_marks_early_source_and_late_price_follower(tmp_path) -> 
         ["trump", "china", "visit", "beijing", "summit"],
     )
 
-    impacts, metrics = run_event_backtest(con, "trump_china", ["6h", "24h"])
+    impacts, metrics = run_event_backtest(con, "trump_china", ["6h", "24h"], mode="event")
 
     by_account = {row["account"]: row for row in metrics}
     early_impacts = [row for row in impacts if row["handle"] == "EarlyAlpha" and row["horizon"] == "24h"]
@@ -118,6 +143,153 @@ def test_event_backtest_marks_early_source_and_late_price_follower(tmp_path) -> 
     assert by_account["EarlyAlpha"]["lead_score"] > by_account["LateFollower"]["lead_score"]
     assert late_impacts[0]["price_move_started_before_post"]
     assert not late_impacts[0]["is_positive"]
+
+
+def test_ramp_backtest_uses_next_tick_entry_and_max_favorable_move(tmp_path) -> None:
+    con = connect(tmp_path / "ramp.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    insert_historical_price_ticks(
+        con,
+        [
+            _tick(now, 0.70),
+            _tick(now + timedelta(minutes=35), 0.71),
+            _tick(now + timedelta(hours=1), 0.84),
+            _tick(now + timedelta(hours=6), 0.78),
+        ],
+    )
+    store_event_case_posts(
+        con,
+        "trump_china",
+        [_post("p1", "RampAlpha", now + timedelta(minutes=30), "Trump may visit Beijing for a Xi summit")],
+        ["trump", "china", "visit", "beijing", "summit"],
+    )
+
+    impacts, metrics = run_event_backtest(con, "trump_china", ["6h"], mode="ramp")
+
+    impact = impacts[0]
+    account = metrics[0]
+    assert impact["entry_mid"] == 0.71
+    assert impact["entry_delay_seconds"] == 300
+    assert round(impact["max_favorable_delta"], 3) == 0.13
+    assert round(impact["close_delta"], 3) == 0.07
+    assert impact["tradable_ramp"]
+    assert impact["strong_ramp"]
+    assert account["recommended_status"] == "ramp_source"
+
+
+def test_ramp_hit_survives_close_reversal(tmp_path) -> None:
+    con = connect(tmp_path / "ramp_reversal.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    insert_historical_price_ticks(
+        con,
+        [
+            _tick(now, 0.70),
+            _tick(now + timedelta(minutes=2), 0.71),
+            _tick(now + timedelta(hours=1), 0.84),
+            _tick(now + timedelta(hours=6), 0.69),
+        ],
+    )
+    store_event_case_posts(
+        con,
+        "trump_china",
+        [_post("p1", "RampAlpha", now + timedelta(minutes=1), "Trump may visit Beijing for a Xi summit")],
+        ["trump", "china", "visit", "beijing", "summit"],
+    )
+
+    impacts, _ = run_event_backtest(con, "trump_china", ["6h"], mode="ramp")
+
+    assert impacts[0]["is_positive"]
+    assert impacts[0]["max_favorable_delta"] > 0.08
+    assert impacts[0]["close_delta"] < 0
+
+
+def test_already_hot_post_can_still_be_tradable_ramp(tmp_path) -> None:
+    con = connect(tmp_path / "already_hot.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    post_at = now + timedelta(hours=6)
+    insert_historical_price_ticks(
+        con,
+        [
+            _tick(now, 0.50),
+            _tick(post_at - timedelta(minutes=5), 0.61),
+            _tick(post_at + timedelta(minutes=2), 0.62),
+            _tick(post_at + timedelta(hours=1), 0.67),
+        ],
+    )
+    store_event_case_posts(
+        con,
+        "trump_china",
+        [_post("p1", "HotAlpha", post_at, "Trump may visit Beijing for a Xi summit")],
+        ["trump", "china", "visit", "beijing", "summit"],
+    )
+
+    impacts, metrics = run_event_backtest(con, "trump_china", ["1h"], mode="ramp")
+
+    assert impacts[0]["already_hot_penalty"]
+    assert impacts[0]["tradable_ramp"]
+    assert "already_hot_penalty" in impacts[0]["risk_tags"]
+    assert metrics[0]["recommended_status"] == "watch"
+
+
+def test_slow_entry_tick_is_not_tradable_ramp(tmp_path) -> None:
+    con = connect(tmp_path / "slow_entry.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    insert_historical_price_ticks(
+        con,
+        [
+            _tick(now, 0.70),
+            _tick(now + timedelta(minutes=30), 0.72),
+            _tick(now + timedelta(hours=1), 0.78),
+        ],
+    )
+    store_event_case_posts(
+        con,
+        "trump_china",
+        [_post("p1", "SlowAlpha", now + timedelta(minutes=1), "Trump may visit Beijing for a Xi summit")],
+        ["trump", "china", "visit", "beijing", "summit"],
+    )
+
+    impacts, metrics = run_event_backtest(con, "trump_china", ["1h"], mode="ramp")
+
+    assert impacts[0]["is_positive"]
+    assert not impacts[0]["tradable_ramp"]
+    assert "slow_entry_tick" in impacts[0]["risk_tags"]
+    assert metrics[0]["recommended_status"] == "noise_or_no_ramp"
+
+
+def test_volatility_backtest_keeps_watch_only_posts_and_scores_abs_moves(tmp_path) -> None:
+    con = connect(tmp_path / "volatility.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    insert_historical_price_ticks(
+        con,
+        [
+            _tick(now, 0.55),
+            _tick(now + timedelta(minutes=5), 0.56),
+            _tick(now + timedelta(hours=1), 0.47),
+            _tick(now + timedelta(hours=6), 0.50),
+        ],
+    )
+    store_event_case_posts(
+        con,
+        "trump_china",
+        [_post("p1", "VolSource", now + timedelta(minutes=1), "White House Iran talks create uncertainty for Trump")],
+        case_keywords("Trump China visit"),
+    )
+
+    impacts, metrics = run_event_backtest(con, "trump_china", ["6h"], mode="volatility")
+
+    assert impacts[0]["mode"] == "volatility"
+    assert impacts[0]["is_positive"]
+    assert impacts[0]["tradable_ramp"]
+    assert round(impacts[0]["max_favorable_delta"], 3) == 0.09
+    assert "direction_unknown" in impacts[0]["risk_tags"]
+    assert "two_sided_volatility" in impacts[0]["risk_tags"]
+    assert metrics[0]["recommended_status"] == "volatility_source"
 
 
 def test_backfill_x_history_stops_when_full_archive_unavailable(tmp_path, monkeypatch) -> None:
@@ -167,4 +339,49 @@ def _post(post_id: str, handle: str, created_at: datetime, text: str) -> dict:
         "created_at": created_at.isoformat(),
         "text": text,
         "raw_json": {"id": post_id, "text": text},
+    }
+
+
+def _seed_case(con, now: datetime) -> None:
+    upsert_markets(
+        con,
+        [
+            MarketRecord(
+                market_slug="will-trump-visit-china",
+                event_slug="trump-china",
+                question="Will Trump visit China?",
+                category="Politics",
+                tags=["Trump", "China"],
+                end_time=(now + timedelta(days=30)).isoformat(),
+                resolution_source=None,
+                clob_token_ids=["yes-token"],
+                liquidity=100_000,
+                raw={},
+            )
+        ],
+    )
+    upsert_event_cases(
+        con,
+        [
+            {
+                "case_id": "trump_china",
+                "query": "Trump China visit",
+                "market_slug": "will-trump-visit-china",
+                "start_at": now.isoformat(),
+                "end_at": (now + timedelta(days=2)).isoformat(),
+                "keywords": ["trump", "china", "visit", "beijing"],
+                "status": "active",
+            }
+        ],
+    )
+
+
+def _tick(observed_at: datetime, mid: float) -> dict:
+    return {
+        "observed_at": observed_at.isoformat(),
+        "market_slug": "will-trump-visit-china",
+        "token_id": "yes-token",
+        "mid": mid,
+        "liquidity": 100_000,
+        "raw": {},
     }
