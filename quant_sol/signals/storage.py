@@ -269,6 +269,17 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    con.execute(
+        """
+        create table if not exists api_usage_log (
+            service varchar not null,
+            endpoint varchar not null,
+            called_at timestamp not null,
+            call_count integer not null,
+            notes varchar
+        )
+        """
+    )
 
 
 def save_raw_payload(namespace: str, label: str, payload: object, fetched_at: Optional[str] = None) -> Path:
@@ -279,6 +290,35 @@ def save_raw_payload(namespace: str, label: str, payload: object, fetched_at: Op
     path = root / f"{safe_ts}_{stable_hash(payload)[:12]}.json"
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def api_calls_today(con: duckdb.DuckDBPyConnection, service: str = "x") -> int:
+    row = con.execute(
+        """
+        select coalesce(sum(call_count), 0)
+        from api_usage_log
+        where service = ? and called_at >= current_date
+        """,
+        [service],
+    ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def record_api_call(
+    con: duckdb.DuckDBPyConnection,
+    service: str,
+    endpoint: str,
+    call_count: int = 1,
+    notes: Optional[str] = None,
+    called_at: Optional[str] = None,
+) -> None:
+    con.execute(
+        """
+        insert into api_usage_log (service, endpoint, called_at, call_count, notes)
+        values (?, ?, ?, ?, ?)
+        """,
+        [service, endpoint, called_at or utc_now_iso(), int(call_count), notes],
+    )
 
 
 def upsert_markets(con: duckdb.DuckDBPyConnection, markets: Iterable[MarketRecord], updated_at: Optional[str] = None) -> int:

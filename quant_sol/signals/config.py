@@ -16,6 +16,7 @@ WALLET_WATCHLIST_PATH = CONFIG_ROOT / "wallet_watchlist.yaml"
 FOMO_MODEL_PATH = CONFIG_ROOT / "fomo_model.yaml"
 WEB3_ACCOUNT_WATCHLIST_PATH = CONFIG_ROOT / "web3_account_watchlist.yaml"
 WEB3_NARRATIVE_KEYWORDS_PATH = CONFIG_ROOT / "web3_narrative_keywords.yaml"
+API_LIMITS_PATH = CONFIG_ROOT / "api_limits.yaml"
 SIGNAL_RAW_ROOT = DATA_ROOT / "raw" / "signals"
 SIGNAL_REPORT_ROOT = DATA_ROOT / "reports"
 
@@ -80,6 +81,17 @@ class Web3AccountConfig:
 class Web3NarrativeKeywords:
     groups: Mapping[str, Tuple[str, ...]]
     role_weights: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class XApiLimits:
+    daily_call_cap: int
+    sync_social_max_handles: int
+    sync_social_max_posts_per_handle: int
+    sync_accounts_max_accounts: int
+    sync_accounts_max_posts_per_account: int
+    sync_follow_graph_max_accounts: int
+    sync_follow_graph_max_following_per_account: int
 
 
 def load_yaml(path: Path) -> dict:
@@ -204,6 +216,23 @@ def load_web3_keywords(path: Path = WEB3_NARRATIVE_KEYWORDS_PATH) -> Web3Narrati
         if isinstance(config, dict)
     }
     return Web3NarrativeKeywords(groups=groups, role_weights=role_weights)
+
+
+def load_x_api_limits(path: Path = API_LIMITS_PATH) -> XApiLimits:
+    payload = load_yaml(path)
+    x_config = payload.get("x") if isinstance(payload.get("x"), dict) else {}
+    sync_social = x_config.get("sync_social") if isinstance(x_config.get("sync_social"), dict) else {}
+    sync_accounts = x_config.get("sync_accounts") if isinstance(x_config.get("sync_accounts"), dict) else {}
+    sync_follow_graph = x_config.get("sync_follow_graph") if isinstance(x_config.get("sync_follow_graph"), dict) else {}
+    return XApiLimits(
+        daily_call_cap=int(x_config.get("daily_call_cap", 80)),
+        sync_social_max_handles=int(sync_social.get("max_handles", 10)),
+        sync_social_max_posts_per_handle=int(sync_social.get("max_posts_per_handle", 20)),
+        sync_accounts_max_accounts=int(sync_accounts.get("max_accounts", 5)),
+        sync_accounts_max_posts_per_account=int(sync_accounts.get("max_posts_per_account", 20)),
+        sync_follow_graph_max_accounts=int(sync_follow_graph.get("max_accounts", 3)),
+        sync_follow_graph_max_following_per_account=int(sync_follow_graph.get("max_following_per_account", 50)),
+    )
 
 
 def normalize_handle(handle: str) -> str:

@@ -109,7 +109,7 @@ class XApiClient:
         data = response.json().get("data") or {}
         return data if isinstance(data, dict) else None
 
-    def backfill_user_posts(self, handle: str, seconds: int) -> List[SocialPost]:
+    def backfill_user_posts(self, handle: str, seconds: int, max_results: int = 100) -> List[SocialPost]:
         user_id = self.user_id(handle)
         if not user_id:
             return []
@@ -117,7 +117,7 @@ class XApiClient:
         response = self.session.get(
             f"{self.base_url}/users/{user_id}/tweets",
             params={
-                "max_results": 100,
+                "max_results": max(5, min(max_results, 100)),
                 "start_time": start_time.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
                 "tweet.fields": "created_at,author_id,entities,referenced_tweets,public_metrics",
             },

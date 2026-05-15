@@ -18,7 +18,9 @@ def test_signals_cli_help_lists_commands() -> None:
     assert "export-account-seeds" in result.stdout
 
 
-def test_telegram_missing_config_returns_warning() -> None:
+def test_telegram_missing_config_returns_warning(monkeypatch) -> None:
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
     client = TelegramClient(bot_token=None, chat_id=None)
     status, error = client.send_message("hello")
 

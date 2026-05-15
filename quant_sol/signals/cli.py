@@ -28,15 +28,19 @@ from .config import (
     load_social_handles,
     load_wallet_watchlist,
     load_web3_accounts,
+    load_x_api_limits,
     parse_duration,
 )
+from .env import has_secret, load_local_env, masked_secret
 from .reporting import write_signal_report
 from .scoring import evaluate_signal_outcomes, score_recent, should_alert
 from .storage import (
     active_markets,
+    api_calls_today,
     alerted_signal_ids,
     connect,
     insert_market_tick,
+    record_api_call,
     record_telegram_alert,
     replace_wallet_activity,
     save_raw_payload,
@@ -53,6 +57,7 @@ from .utils import first_float, first_text, parse_timestamp, utc_now_iso
 
 app = typer.Typer(help="Read-only prediction-market information arbitrage Research OS.")
 console = Console()
+load_local_env()
 
 
 @app.command("discover-markets")
@@ -75,6 +80,10 @@ def sync_social(
     backfill: str = typer.Option("24h", "--backfill", help="Backfill window, e.g. 1h, 24h, 7d."),
     csv_path: Optional[str] = typer.Option(None, "--csv", help="Optional CSV fallback with handle,post_id,created_at,text,url columns."),
     validate_handles: bool = typer.Option(False, "--validate-handles", help="Validate configured handles through X API before backfill."),
+    max_handles: Optional[int] = typer.Option(None, "--max-handles", help="Limit X handles touched in this run."),
+    max_posts_per_handle: Optional[int] = typer.Option(None, "--max-posts-per-handle", help="Limit timeline rows requested per handle."),
+    daily_cap: Optional[int] = typer.Option(None, "--daily-cap", help="Local daily X API call cap."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Estimate calls without contacting X API."),
 ) -> None:
     """Backfill public X posts from configured watchlist handles."""
     con = connect()
@@ -89,7 +98,16 @@ def sync_social(
         console.print("[yellow]X_BEARER_TOKEN is not set. Use --csv for manual fallback or configure official X API access.[/yellow]")
         return
 
-    handles = load_social_handles()
+    limits = load_x_api_limits()
+    handle_limit = max_handles or limits.sync_social_max_handles
+    post_limit = max_posts_per_handle or limits.sync_social_max_posts_per_handle
+    cap = daily_cap or limits.daily_call_cap
+    handles = load_social_handles()[:handle_limit]
+    planned_calls = len(handles) * (3 if validate_handles else 2)
+    if not _check_x_budget(con, planned_calls, cap, dry_run, f"sync-social handles={len(handles)} max_posts={post_limit}"):
+        return
+    if dry_run:
+        return
     client = XApiClient(token)
     seconds = parse_duration(backfill)
     total = 0
@@ -97,9 +115,14 @@ def sync_social(
     for handle in handles:
         try:
             if validate_handles and not client.validate_handle(handle.handle):
+                record_api_call(con, "x", "users/by/username", notes=f"validate @{handle.handle}")
                 inactive.append(handle.handle)
                 continue
-            posts = client.backfill_user_posts(handle.handle, seconds)
+            if validate_handles:
+                record_api_call(con, "x", "users/by/username", notes=f"validate @{handle.handle}")
+            posts = client.backfill_user_posts(handle.handle, seconds, max_results=post_limit)
+            record_api_call(con, "x", "users/by/username", notes=f"resolve @{handle.handle}")
+            record_api_call(con, "x", "users/:id/tweets", notes=f"timeline @{handle.handle}")
         except RequestException as exc:
             console.print(f"[yellow]warning: @{handle.handle} backfill failed: {exc}[/yellow]")
             continue
@@ -110,6 +133,43 @@ def sync_social(
     console.print(f"Synced {total} X post(s).")
     if inactive:
         console.print(f"[yellow]Inactive handles: {', '.join(inactive)}[/yellow]")
+
+
+@app.command("check-api")
+def check_api(
+    service: str = typer.Option("x", "--service", help="API service to check. V1 supports x."),
+    handle: str = typer.Option("WuBlockchain", "--handle", help="X handle used for a minimal read-only test call."),
+    no_call: bool = typer.Option(False, "--no-call", help="Only verify local env configuration; do not call external API."),
+) -> None:
+    """Check local API credentials before running paid data sync commands."""
+    load_local_env()
+    if service != "x":
+        console.print(f"[yellow]Unsupported service '{service}'. V1 supports x.[/yellow]")
+        return
+    if not has_secret("X_BEARER_TOKEN"):
+        console.print("[yellow]X_BEARER_TOKEN is missing. Copy .env.example to .env and paste your Bearer Token.[/yellow]")
+        return
+    console.print(f"X_BEARER_TOKEN configured: {masked_secret('X_BEARER_TOKEN')}")
+    if no_call:
+        console.print("Skipped external API call.")
+        return
+    con = connect()
+    if not _check_x_budget(con, 1, load_x_api_limits().daily_call_cap, False, "check-api"):
+        return
+    try:
+        profile = XApiClient(os.environ["X_BEARER_TOKEN"]).user_profile(handle.lstrip("@"))
+    except RequestException as exc:
+        console.print(f"[red]X API check failed: {exc}[/red]")
+        return
+    record_api_call(con, "x", "users/by/username", notes=f"check @{handle.lstrip('@')}")
+    if not profile:
+        console.print(f"[yellow]X API responded, but @{handle.lstrip('@')} was not resolved.[/yellow]")
+        return
+    metrics = profile.get("public_metrics") or {}
+    console.print(
+        f"X API OK: @{profile.get('username', handle.lstrip('@'))} "
+        f"id={profile.get('id')} followers={metrics.get('followers_count', 'n/a')}"
+    )
 
 
 @app.command("discover-accounts")
@@ -133,6 +193,10 @@ def sync_accounts(
     backfill: str = typer.Option("7d", "--backfill", help="Timeline backfill window, e.g. 24h, 7d."),
     accounts_csv: Optional[str] = typer.Option(None, "--accounts-csv", help="Optional CSV fallback for account profile rows."),
     posts_csv: Optional[str] = typer.Option(None, "--posts-csv", help="Optional CSV fallback for post rows."),
+    max_accounts: Optional[int] = typer.Option(None, "--max-accounts", help="Limit X accounts touched in this run."),
+    max_posts_per_account: Optional[int] = typer.Option(None, "--max-posts-per-account", help="Limit timeline rows requested per account."),
+    daily_cap: Optional[int] = typer.Option(None, "--daily-cap", help="Local daily X API call cap."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Estimate calls without contacting X API."),
 ) -> None:
     """Sync Web3 X account profiles and posts through X API, or import CSV fallback data."""
     if watchlist != "web3":
@@ -156,14 +220,32 @@ def sync_accounts(
         console.print(f"Seeded {seeded} configured Web3 account(s).")
         return
 
+    limits = load_x_api_limits()
+    account_limit = max_accounts or limits.sync_accounts_max_accounts
+    post_limit = max_posts_per_account or limits.sync_accounts_max_posts_per_account
+    cap = daily_cap or limits.daily_call_cap
+    selected_accounts = accounts[:account_limit]
+    planned_calls = len(selected_accounts) * 3
+    if not _check_x_budget(
+        con,
+        planned_calls,
+        cap,
+        dry_run,
+        f"sync-accounts accounts={len(selected_accounts)} max_posts={post_limit}",
+    ):
+        return
+    if dry_run:
+        return
+
     client = XApiClient(token)
     seconds = parse_duration(backfill)
     profile_count = 0
     post_count = 0
     inactive = []
-    for account in accounts:
+    for account in selected_accounts:
         try:
             profile = client.user_profile(account.handle)
+            record_api_call(con, "x", "users/by/username", notes=f"profile @{account.handle}")
             if not profile:
                 inactive.append(account.handle)
                 upsert_x_accounts(
@@ -197,7 +279,9 @@ def sync_accounts(
                 ],
             )
             profile_count += 1
-            posts = client.backfill_user_post_dicts(account.handle, seconds)
+            posts = client.backfill_user_post_dicts(account.handle, seconds, max_results=post_limit)
+            record_api_call(con, "x", "users/by/username", notes=f"resolve @{account.handle}")
+            record_api_call(con, "x", "users/:id/tweets", notes=f"timeline @{account.handle}")
         except RequestException as exc:
             console.print(f"[yellow]warning: @{account.handle} account sync failed: {exc}[/yellow]")
             continue
@@ -214,8 +298,11 @@ def sync_accounts(
 
 @app.command("sync-follow-graph")
 def sync_follow_graph(
-    top: int = typer.Option(100, "--top", help="Number of ranked/configured accounts to inspect and max following rows per account."),
+    top: Optional[int] = typer.Option(None, "--top", help="Number of ranked/configured accounts to inspect."),
+    max_following_per_account: Optional[int] = typer.Option(None, "--max-following-per-account", help="Limit following rows requested per account."),
+    daily_cap: Optional[int] = typer.Option(None, "--daily-cap", help="Local daily X API call cap."),
     csv_path: Optional[str] = typer.Option(None, "--csv", help="Optional CSV fallback with source_handle,target_handle,relationship."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Estimate calls without contacting X API."),
 ) -> None:
     """Sync following edges for high-signal accounts, or import follow-graph CSV fallback data."""
     con = connect()
@@ -229,15 +316,33 @@ def sync_follow_graph(
         console.print("[yellow]X_BEARER_TOKEN is not set. Use --csv to import follow graph notes from Chrome review.[/yellow]")
         return
 
-    handles = _top_account_handles(con, top)
+    limits = load_x_api_limits()
+    account_limit = top or limits.sync_follow_graph_max_accounts
+    following_limit = max_following_per_account or limits.sync_follow_graph_max_following_per_account
+    handles = _top_account_handles(con, account_limit)
     if not handles:
-        handles = [account.handle for account in load_web3_accounts()[:top]]
+        handles = [account.handle for account in load_web3_accounts()[:account_limit]]
+    handles = handles[:account_limit]
+    planned_calls = len(handles) * 2
+    if not _check_x_budget(
+        con,
+        planned_calls,
+        daily_cap or limits.daily_call_cap,
+        dry_run,
+        f"sync-follow-graph accounts={len(handles)} max_following={following_limit}",
+    ):
+        return
+    if dry_run:
+        return
+
     client = XApiClient(token)
     edge_count = 0
     upstream_profiles = []
-    for handle in handles[:top]:
+    for handle in handles:
         try:
-            following = client.following(handle, max_results=min(max(top, 1), 1000))
+            following = client.following(handle, max_results=following_limit)
+            record_api_call(con, "x", "users/by/username", notes=f"resolve @{handle}")
+            record_api_call(con, "x", "users/:id/following", notes=f"following @{handle}")
         except RequestException as exc:
             console.print(f"[yellow]warning: @{handle} following sync failed: {exc}[/yellow]")
             continue
@@ -269,7 +374,7 @@ def sync_follow_graph(
             save_raw_payload("x_following", handle, following)
     if upstream_profiles:
         upsert_x_accounts(con, upstream_profiles)
-    console.print(f"Synced {edge_count} follow graph edge(s) from {len(handles[:top])} account(s).")
+    console.print(f"Synced {edge_count} follow graph edge(s) from {len(handles)} account(s).")
 
 
 @app.command("rank-accounts")
@@ -435,6 +540,24 @@ def _top_account_handles(con, limit: int) -> list[str]:
         [limit],
     ).fetchall()
     return [str(row[0]) for row in account_rows]
+
+
+def _check_x_budget(con, planned_calls: int, daily_cap: int, dry_run: bool, label: str) -> bool:
+    used = api_calls_today(con, "x")
+    remaining = max(0, daily_cap - used)
+    console.print(
+        f"X API budget: used_today={used}, planned_calls={planned_calls}, "
+        f"daily_cap={daily_cap}, remaining_after={remaining - planned_calls}"
+    )
+    if planned_calls > remaining:
+        console.print(
+            f"[yellow]Stopped before external calls: {label} would exceed the local daily cap. "
+            "Increase --daily-cap explicitly if you really want to run it.[/yellow]"
+        )
+        return False
+    if dry_run:
+        console.print(f"Dry run only: {label}. No X API calls made.")
+    return True
 
 
 def _render_account_metrics(metrics: list[dict]) -> None:
