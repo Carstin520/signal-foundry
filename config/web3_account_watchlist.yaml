@@ -1,0 +1,38 @@
+watchlist: web3
+accounts:
+  - handle: Arkham
+    language: en
+    region: global
+    role: confirmation_sources
+    priority: seed
+    notes: "Onchain intelligence / entity labels. Useful as confirmation and downstream source discovery."
+  - handle: WuBlockchain
+    language: mixed
+    region: cn
+    role: fast_curators
+    priority: seed
+    notes: "Fast bilingual crypto news curator."
+  - handle: tier10k
+    language: en
+    region: global
+    role: fast_curators
+    priority: seed
+    notes: "Fast crypto headline curator."
+  - handle: Lookonchain
+    language: en
+    region: global
+    role: originators
+    priority: seed
+    notes: "Onchain whale/activity narrative origin candidate."
+  - handle: ai_9684xtpa
+    language: zh
+    region: cn
+    role: originators
+    priority: seed
+    notes: "Chinese onchain tracking account candidate."
+  - handle: lianyanshe
+    language: zh
+    region: cn
+    role: fast_curators
+    priority: seed
+    notes: "Chinese crypto/Web3 news curator candidate."

@@ -1,0 +1,53 @@
+price_bands:
+  ideal_min: 0.12
+  ideal_max: 0.45
+  acceptable_min: 0.08
+  acceptable_max: 0.60
+  lottery_tail_max: 0.03
+  crowded_min: 0.70
+deadlines:
+  hard_reject_hours: 72
+  soft_penalty_days: 14
+movement:
+  already_moved_6h_pp: 0.08
+  already_moved_24h_pp: 0.15
+  positive_outcome_pp: 0.03
+  strong_favorable_pp: 0.08
+  strong_adverse_max_pp: 0.05
+liquidity:
+  minimum: 10000
+  max_spread: 0.05
+alert:
+  threshold: 75
+windows:
+  short: 1h
+  medium: 6h
+  base: 24h
+direction_keywords:
+  bullish:
+    - win
+    - wins
+    - lead
+    - leading
+    - surge
+    - nomination
+    - nominee
+    - favorite
+    - support
+    - escalation
+    - strike risk
+    - tariff likely
+    - likely
+  bearish:
+    - deny
+    - denies
+    - reject
+    - rejects
+    - ceasefire
+    - delay
+    - delayed
+    - drop
+    - drops
+    - resign unlikely
+    - no strike
+    - unlikely

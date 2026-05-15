@@ -1,0 +1,103 @@
+groups:
+  airdrop:
+    en:
+      - airdrop
+      - points
+      - token launch
+      - claim
+      - eligibility
+    zh:
+      - 空投
+      - 积分
+      - 发币
+      - 领取
+      - 资格
+  listings:
+    en:
+      - listing
+      - listed
+      - binance
+      - coinbase
+      - upbit
+      - bybit
+      - okx
+    zh:
+      - 上线
+      - 上币
+      - 币安
+      - 欧易
+      - 交易所
+  regulation:
+    en:
+      - ETF
+      - SEC
+      - regulation
+      - lawsuit
+      - approval
+      - enforcement
+    zh:
+      - 监管
+      - 批准
+      - 诉讼
+      - 执法
+      - 现货ETF
+  security:
+    en:
+      - hack
+      - exploit
+      - stolen
+      - drained
+      - compromised
+    zh:
+      - 被盗
+      - 黑客
+      - 漏洞
+      - 攻击
+      - 被攻击
+  ecosystems:
+    en:
+      - Solana
+      - Base
+      - Hyperliquid
+      - Berachain
+      - Monad
+      - Ethereum
+      - Bitcoin
+      - restaking
+      - staking
+      - L2
+    zh:
+      - 索拉纳
+      - 以太坊
+      - 比特币
+      - 再质押
+      - 质押
+      - 二层
+      - 链游
+      - 铭文
+  memecoins:
+    en:
+      - memecoin
+      - meme
+      - pump
+      - degen
+    zh:
+      - 土狗
+      - meme
+      - 冲土狗
+      - 拉盘
+roles:
+  originators:
+    score_weight: 25
+  fast_curators:
+    score_weight: 22
+  amplifiers:
+    score_weight: 18
+  market_translators:
+    score_weight: 20
+  upstream_sources:
+    score_weight: 24
+  confirmation_sources:
+    score_weight: 0
+  noise_or_late:
+    score_weight: 2

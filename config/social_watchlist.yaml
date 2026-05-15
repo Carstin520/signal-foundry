@@ -1,0 +1,36 @@
+platform: x
+categories:
+  confirmation_sources:
+    handles:
+      - WhiteHouse
+      - POTUS
+      - StateDept
+      - SecDef
+      - CENTCOM
+      - IDF
+      - netanyahu
+      - ZelenskyyUa
+      - NATO
+      - mfa_russia
+    source_score: 0
+  elite_information:
+    handles: []
+    source_score: 25
+  osint_geopolitics:
+    handles:
+      - PressTV
+    source_score: 20
+  polling_models:
+    handles: []
+    source_score: 22
+  market_participants:
+    handles: []
+    source_score: 18
+  mass_sentiment:
+    handles:
+      - realDonaldTrump
+      - JDVance
+      - SpeakerJohnson
+      - SenateGOP
+      - TheDemocrats
+    source_score: 8

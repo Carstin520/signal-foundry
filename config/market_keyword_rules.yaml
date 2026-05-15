@@ -1,0 +1,75 @@
+category: politics
+keywords:
+  - strike
+  - strikes
+  - ceasefire
+  - sanction
+  - sanctions
+  - tariff
+  - tariffs
+  - election
+  - resign
+  - resignation
+  - nomination
+  - nominate
+  - debate
+  - poll
+  - polling
+  - missile
+  - missiles
+  - hostage
+  - hostages
+  - war
+  - peace
+  - trump
+  - vance
+  - iran
+  - israel
+  - gaza
+  - ukraine
+  - russia
+  - nato
+entities:
+  iran:
+    - iran
+    - khamenei
+    - tehran
+  israel:
+    - israel
+    - idf
+    - netanyahu
+    - gaza
+  ukraine:
+    - ukraine
+    - zelensky
+    - zelenskyy
+  russia:
+    - russia
+    - putin
+    - kremlin
+  us_politics:
+    - trump
+    - vance
+    - white house
+    - senate
+    - election
+    - poll
+actions:
+  conflict:
+    - strike
+    - strikes
+    - missile
+    - missiles
+    - ceasefire
+    - hostage
+  election:
+    - election
+    - poll
+    - debate
+    - nomination
+    - resign
+  policy:
+    - sanction
+    - sanctions
+    - tariff
+    - tariffs
