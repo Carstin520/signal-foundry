@@ -24,12 +24,12 @@ class GammaMarketClient:
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json", "User-Agent": "signal-foundry-research-os/0.1"})
 
-    def list_markets(self, limit: int = 500, max_pages: int = 3) -> List[dict]:
+    def list_markets(self, limit: int = 500, max_pages: int = 3, closed: bool = False) -> List[dict]:
         markets: List[dict] = []
         for page in range(max_pages):
             response = self.session.get(
                 f"{self.base_url}/markets",
-                params={"limit": limit, "offset": page * limit, "closed": "false"},
+                params={"limit": limit, "offset": page * limit, "closed": "true" if closed else "false"},
                 timeout=self.timeout,
             )
             response.raise_for_status()
@@ -193,6 +193,49 @@ class XApiClient:
         response.raise_for_status()
         return response.json()
 
+    def full_archive_counts(self, query: str, start_time: str, end_time: str) -> dict:
+        response = self.session.get(
+            f"{self.base_url}/tweets/counts/all",
+            params={"query": query, "start_time": start_time, "end_time": end_time},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def full_archive_search(
+        self,
+        query: str,
+        start_time: str,
+        end_time: str,
+        max_results: int = 100,
+    ) -> List[dict]:
+        response = self.session.get(
+            f"{self.base_url}/tweets/search/all",
+            params={
+                "query": query,
+                "start_time": start_time,
+                "end_time": end_time,
+                "max_results": max(10, min(max_results, 100)),
+                "sort_order": "recency",
+                "tweet.fields": "created_at,author_id,entities,referenced_tweets,public_metrics,lang",
+                "expansions": "author_id",
+                "user.fields": "username,verified,public_metrics",
+            },
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        users = {
+            str(user.get("id")): user.get("username")
+            for user in (payload.get("includes") or {}).get("users", [])
+            if isinstance(user, dict)
+        }
+        rows = []
+        for item in payload.get("data") or []:
+            if isinstance(item, dict):
+                rows.append(post_dict_from_x(users.get(str(item.get("author_id")), str(item.get("author_id"))), item))
+        return rows
+
     def filtered_stream_rules(self) -> dict:
         response = self.session.get(f"{self.base_url}/tweets/search/stream/rules", timeout=self.timeout)
         response.raise_for_status()
@@ -220,6 +263,29 @@ class CLOBClient:
         response.raise_for_status()
         payload = response.json()
         return first_float(payload, "mid", "midpoint")
+
+    def batch_prices_history(
+        self,
+        token_ids: Sequence[str],
+        start_ts: int,
+        end_ts: int,
+        interval: str = "1m",
+        fidelity: int = 1,
+    ) -> dict:
+        response = self.session.post(
+            f"{self.base_url}/batch-prices-history",
+            json={
+                "markets": list(token_ids)[:20],
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "interval": interval,
+                "fidelity": fidelity,
+            },
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
 
 
 class CLOBWebSocket:

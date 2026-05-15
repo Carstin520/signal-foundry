@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -33,6 +34,19 @@ from .config import (
     parse_duration,
 )
 from .env import has_secret, load_local_env, masked_secret
+from .diagnostics import model_diagnostics, write_model_diagnostics
+from .history import (
+    case_keywords,
+    discover_event_case as discover_event_case_record,
+    event_case_token_rows,
+    get_event_case,
+    normalize_price_history,
+    run_event_backtest as run_event_backtest_case,
+    store_event_case_posts,
+    write_event_backtest_report,
+    x_case_query,
+    x_time,
+)
 from .reporting import write_signal_report
 from .scoring import evaluate_signal_outcomes, score_recent, should_alert
 from .storage import (
@@ -41,6 +55,7 @@ from .storage import (
     alerted_signal_ids,
     connect,
     insert_market_midpoint_tick,
+    insert_historical_price_ticks,
     insert_market_tick,
     record_api_call,
     record_telegram_alert,
@@ -398,6 +413,177 @@ def report_accounts(
     console.print(f"Wrote account report: {path}")
 
 
+@app.command("diagnose-model")
+def diagnose_model(
+    date: Optional[str] = typer.Option(None, "--date", help="Optional report suffix date YYYY-MM-DD."),
+) -> None:
+    """Write a local diagnostics report for model repair completion and data coverage."""
+    con = connect()
+    diagnostics = model_diagnostics(con)
+    path = write_model_diagnostics(con, SIGNAL_REPORT_ROOT, date=date)
+    blockers = diagnostics["blockers"]
+    console.print(f"Wrote model diagnostics: {path}")
+    if blockers:
+        console.print("[yellow]Open blockers: " + ", ".join(blockers) + "[/yellow]")
+    else:
+        console.print("No open model blockers detected.")
+
+
+@app.command("discover-event-case")
+def discover_event_case(
+    query: str = typer.Option(..., "--query", help="Event query, e.g. 'Trump China visit'."),
+    start: str = typer.Option(..., "--start", help="Case start date/time, e.g. YYYY-MM-DD."),
+    end: str = typer.Option(..., "--end", help="Case end date/time, e.g. YYYY-MM-DD."),
+    case: Optional[str] = typer.Option(None, "--case", help="Optional case id. Defaults to slugified query."),
+    market_slug: Optional[str] = typer.Option(None, "--market-slug", help="Optional exact market slug override."),
+    max_pages: int = typer.Option(4, "--max-pages", help="Gamma API pages to scan, open and closed."),
+) -> None:
+    """Discover and register a historical event backtest case."""
+    con = connect()
+    result = discover_event_case_record(
+        con,
+        query=query,
+        start_at=parse_timestamp(start) or start,
+        end_at=parse_timestamp(end) or end,
+        case_id=case,
+        max_pages=max_pages,
+        market_slug=market_slug,
+    )
+    selected = result.get("selected_market")
+    if selected:
+        save_raw_payload("event_cases", result["case_id"], selected.raw)
+        console.print(
+            f"Registered case {result['case_id']} -> {selected.market_slug} "
+            f"({result['candidate_count']} candidate market(s))."
+        )
+    else:
+        console.print(f"[yellow]Registered unresolved case {result['case_id']}; no matching market found.[/yellow]")
+
+
+@app.command("backfill-market-history")
+def backfill_market_history(
+    case: str = typer.Option(..., "--case", help="Historical event case id."),
+    interval: str = typer.Option("1m", "--interval", help="Polymarket history interval: 1m, 1h, 6h, 1d, 1w, all, max."),
+    fidelity: int = typer.Option(1, "--fidelity", help="History fidelity in minutes."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show request plan without calling CLOB."),
+) -> None:
+    """Backfill Polymarket historical prices for an event case."""
+    con = connect()
+    case_row = get_event_case(con, case)
+    if not case_row:
+        console.print(f"[yellow]No event case named {case}. Run discover-event-case first.[/yellow]")
+        return
+    token_rows = event_case_token_rows(con, case)
+    start_dt = _to_datetime_or_none(case_row.get("start_at"))
+    end_dt = _to_datetime_or_none(case_row.get("end_at"))
+    if not token_rows or start_dt is None or end_dt is None:
+        console.print("[yellow]Case is missing market token ids or valid time window.[/yellow]")
+        return
+    planned_calls = len(_chunks(token_rows, 20))
+    console.print(
+        f"Polymarket history plan: case={case}, market={case_row['market_slug']}, "
+        f"tokens={len(token_rows)}, requests={planned_calls}, interval={interval}, fidelity={fidelity}"
+    )
+    if dry_run:
+        console.print("Dry run only: no CLOB calls made.")
+        return
+    client = CLOBClient()
+    total = 0
+    for chunk in _chunks(token_rows, 20):
+        token_ids = [row["token_id"] for row in chunk]
+        payload = client.batch_prices_history(
+            token_ids,
+            start_ts=int(start_dt.timestamp()),
+            end_ts=int(end_dt.timestamp()),
+            interval=interval,
+            fidelity=fidelity,
+        )
+        save_raw_payload("polymarket_price_history", case, payload)
+        token_to_market = {row["token_id"]: row for row in chunk}
+        rows = normalize_price_history(payload, token_to_market)
+        total += insert_historical_price_ticks(con, rows)
+    console.print(f"Backfilled {total} historical price tick(s).")
+
+
+@app.command("backfill-x-history")
+def backfill_x_history(
+    case: str = typer.Option(..., "--case", help="Historical event case id."),
+    mode: str = typer.Option("x-api", "--mode", help="History source. V1 supports x-api."),
+    daily_cap: Optional[int] = typer.Option(None, "--daily-cap", help="Local daily X API call cap."),
+    max_accounts: Optional[int] = typer.Option(None, "--max-accounts", help="Maximum signal accounts to query."),
+    max_posts_per_account: int = typer.Option(25, "--max-posts-per-account", help="Maximum posts requested per account."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Estimate X calls without contacting X API."),
+) -> None:
+    """Backfill X posts for an event case using official X full-archive API."""
+    if mode != "x-api":
+        console.print(f"[yellow]Unsupported mode '{mode}'. V1 supports x-api.[/yellow]")
+        return
+    con = connect()
+    case_row = get_event_case(con, case)
+    if not case_row:
+        console.print(f"[yellow]No event case named {case}. Run discover-event-case first.[/yellow]")
+        return
+    token = os.getenv("X_BEARER_TOKEN")
+    if not token:
+        console.print("[yellow]X_BEARER_TOKEN is not set. Cannot use X full-archive search.[/yellow]")
+        return
+    accounts = load_web3_accounts()
+    selected = accounts[: max_accounts or load_x_api_limits().sync_accounts_max_accounts]
+    planned_calls = len(selected) * 2
+    cap = daily_cap or load_x_api_limits().daily_call_cap
+    if not _check_x_budget(con, planned_calls, cap, dry_run, f"backfill-x-history case={case} accounts={len(selected)}"):
+        return
+    if dry_run:
+        return
+
+    client = XApiClient(token)
+    keywords = case_row.get("keywords") or case_keywords(str(case_row.get("query") or ""))
+    start_time = x_time(case_row["start_at"])
+    end_time = x_time(case_row["end_at"])
+    total = 0
+    for account in selected:
+        query = x_case_query(account.handle, keywords)
+        try:
+            counts = client.full_archive_counts(query, start_time, end_time)
+            record_api_call(con, "x", "tweets/counts/all", notes=f"case={case} @{account.handle}")
+            posts = client.full_archive_search(query, start_time, end_time, max_results=max_posts_per_account)
+            record_api_call(con, "x", "tweets/search/all", notes=f"case={case} @{account.handle}")
+        except RequestException as exc:
+            if _http_status(exc) in {401, 403}:
+                console.print(
+                    "[yellow]X full-archive search is unavailable for this token. "
+                    "Historical backtest cannot be populated from X API; use a recent 7-day case or upgrade X access.[/yellow]"
+                )
+                return
+            console.print(f"[yellow]warning: X history failed for @{account.handle}: {exc}[/yellow]")
+            continue
+        save_raw_payload("x_event_history", f"{case}_{account.handle}_counts", counts)
+        if posts:
+            save_raw_payload("x_event_history", f"{case}_{account.handle}_posts", [post.get("raw_json") or post for post in posts])
+        total += store_event_case_posts(con, case, posts, keywords)
+    console.print(f"Backfilled {total} event case post(s).")
+
+
+@app.command("run-event-backtest")
+def run_event_backtest(
+    case: str = typer.Option(..., "--case", help="Historical event case id."),
+    horizons: str = typer.Option("1h,6h,24h,72h", "--horizons", help="Comma-separated horizons."),
+) -> None:
+    """Run post-level event-study backtest for an event case."""
+    horizon_values = [part.strip() for part in horizons.split(",") if part.strip()]
+    impacts, metrics = run_event_backtest_case(connect(), case, horizon_values)
+    console.print(f"Backtested {len(impacts)} post impact row(s); wrote {len(metrics)} account metric row(s).")
+
+
+@app.command("report-event-backtest")
+def report_event_backtest(
+    case: str = typer.Option(..., "--case", help="Historical event case id."),
+) -> None:
+    """Write a local markdown historical event backtest report."""
+    path = write_event_backtest_report(connect(), case, SIGNAL_REPORT_ROOT)
+    console.print(f"Wrote event backtest report: {path}")
+
+
 @app.command("export-account-seeds")
 def export_account_seeds(
     format: str = typer.Option("csv", "--format", help="Export format. V1 supports csv."),
@@ -472,27 +658,53 @@ def sync_market_ticks(
 ) -> None:
     """Snapshot public CLOB midpoint prices for discovered markets."""
     con = connect()
-    markets = _markets_for_tick_sync(con, category, max_markets)
-    token_rows = []
-    for market in markets:
-        for token_id in _json_list(market.get("clob_token_ids"))[:1]:
-            token_rows.append((market["market_slug"], token_id, market.get("liquidity")))
+    markets, token_rows = _market_tick_plan(con, category, max_markets)
     console.print(f"Polymarket CLOB plan: markets={len(markets)}, token_midpoints={len(token_rows)}")
     if dry_run:
         console.print("Dry run only: no CLOB calls made.")
         return
-    client = CLOBClient()
-    observed_at = utc_now_iso()
-    count = 0
-    for market_slug, token_id, liquidity in token_rows:
-        try:
-            mid = client.midpoint(token_id)
-        except RequestException as exc:
-            console.print(f"[yellow]warning: midpoint failed for {market_slug}/{token_id}: {exc}[/yellow]")
-            continue
-        insert_market_midpoint_tick(con, observed_at, market_slug, token_id, mid, liquidity, {"mid": mid, "token_id": token_id})
-        count += 1
+    count = _snapshot_market_ticks(con, token_rows)
     console.print(f"Synced {count} CLOB midpoint tick(s).")
+
+
+@app.command("collect-market-ticks")
+def collect_market_ticks(
+    category: str = typer.Option("all", "--category", help="Market category filter: crypto, politics, or all."),
+    max_markets: int = typer.Option(20, "--max-markets", help="Maximum markets to snapshot per iteration."),
+    interval_seconds: int = typer.Option(300, "--interval-seconds", help="Seconds between midpoint snapshots."),
+    iterations: int = typer.Option(12, "--iterations", help="Number of snapshot iterations. Use a bounded value."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show collection plan without calling CLOB."),
+) -> None:
+    """Continuously collect bounded Polymarket CLOB midpoint snapshots."""
+    con = connect()
+    markets, token_rows = _market_tick_plan(con, category, max_markets)
+    planned_calls = len(token_rows) * max(0, iterations)
+    console.print(
+        f"Polymarket CLOB continuous plan: category={category}, markets={len(markets)}, "
+        f"token_midpoints_per_iteration={len(token_rows)}, iterations={iterations}, "
+        f"interval_seconds={interval_seconds}, planned_calls={planned_calls}"
+    )
+    if iterations <= 0:
+        console.print("[yellow]iterations must be positive.[/yellow]")
+        return
+    if interval_seconds < 0:
+        console.print("[yellow]interval-seconds must be non-negative.[/yellow]")
+        return
+    if not token_rows:
+        console.print("[yellow]No token ids found. Run discover-markets first.[/yellow]")
+        return
+    if dry_run:
+        console.print("Dry run only: no CLOB calls made.")
+        return
+
+    total = 0
+    for index in range(iterations):
+        count = _snapshot_market_ticks(con, token_rows)
+        total += count
+        console.print(f"Iteration {index + 1}/{iterations}: synced {count} midpoint tick(s).")
+        if index < iterations - 1:
+            time.sleep(interval_seconds)
+    console.print(f"Collected {total} CLOB midpoint tick(s) across {iterations} iteration(s).")
 
 
 @app.command("score")
@@ -605,6 +817,46 @@ def _markets_for_tick_sync(con, category: str, max_markets: int) -> list[dict]:
         if any(keyword in haystack for keyword in keywords):
             matched.append(market)
     return matched[:max_markets]
+
+
+def _market_tick_plan(con, category: str, max_markets: int):
+    markets = _markets_for_tick_sync(con, category, max_markets)
+    token_rows = []
+    for market in markets:
+        for token_id in _json_list(market.get("clob_token_ids"))[:1]:
+            token_rows.append((market["market_slug"], token_id, market.get("liquidity")))
+    return markets, token_rows
+
+
+def _snapshot_market_ticks(con, token_rows) -> int:
+    client = CLOBClient()
+    observed_at = utc_now_iso()
+    count = 0
+    for market_slug, token_id, liquidity in token_rows:
+        try:
+            mid = client.midpoint(token_id)
+        except RequestException as exc:
+            console.print(f"[yellow]warning: midpoint failed for {market_slug}/{token_id}: {exc}[/yellow]")
+            continue
+        insert_market_midpoint_tick(con, observed_at, market_slug, token_id, mid, liquidity, {"mid": mid, "token_id": token_id})
+        count += 1
+    return count
+
+
+def _chunks(rows, size: int):
+    return [rows[index:index + size] for index in range(0, len(rows), size)]
+
+
+def _to_datetime_or_none(value):
+    from .utils import to_datetime
+
+    return to_datetime(value)
+
+
+def _http_status(exc: BaseException) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return int(status) if status is not None else None
 
 
 def _check_x_budget(con, planned_calls: int, daily_cap: int, dry_run: bool, label: str) -> bool:

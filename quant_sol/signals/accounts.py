@@ -135,7 +135,8 @@ def write_account_report(con: duckdb.DuckDBPyConnection, lookback: str, report_r
     for chain in chains[:20]:
         lines.append(
             f"- @{chain['upstream_account']} -> @{chain['downstream_account']}: "
-            f"{_fmt(chain['lead_time_minutes'])} min lead, confidence {_fmt(chain['confidence'])}, "
+            f"{_fmt(chain['lead_time_minutes'])} min lead, evidence {chain['evidence_type']}, "
+            f"confidence {_fmt(chain['confidence'])}, "
             f"narratives {chain['shared_narratives']}"
         )
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -192,6 +193,7 @@ def _build_mentions(posts: Sequence[dict], keywords: Web3NarrativeKeywords) -> L
                     "post_id": post["post_id"],
                     "created_at": post["created_at"],
                     "public_metrics": post.get("public_metrics") or {},
+                    "referenced_tweets": post.get("referenced_tweets") or [],
                     "text": post.get("text") or "",
                     "entities": _entities_from_terms(terms),
                     "direction": _direction_from_text(post.get("text") or ""),
@@ -228,6 +230,7 @@ def _direct_market_mentions(posts: Sequence[dict], markets: Sequence[dict]) -> L
                     "confidence": confidence,
                     "direction": _direction_from_text(post_text),
                     "post_created_at": post.get("created_at"),
+                    "referenced_tweets": post.get("referenced_tweets") or [],
                 }
             )
     return linked
@@ -243,6 +246,7 @@ def _mentions_from_market_mentions(market_mentions: Sequence[dict]) -> List[dict
                 "post_id": item["post_id"],
                 "created_at": item["post_created_at"],
                 "public_metrics": {},
+                "referenced_tweets": item.get("referenced_tweets") or [],
                 "text": "",
                 "entities": [item.get("entity")] if item.get("entity") else [],
                 "direction": item.get("direction") or "watch_only",
@@ -320,7 +324,12 @@ def _impact_metrics(
     linked_counts = Counter(row["account"] for row in market_mentions if float(row.get("confidence") or 0) >= 0.6)
     chain_score = Counter()
     for chain in chains:
-        multiplier = 20 if chain.get("evidence_type") == "following_lead" else 4
+        if chain.get("evidence_type") == "following_lead":
+            multiplier = 20
+        elif chain.get("evidence_type") == "post_reference_lead":
+            multiplier = 16
+        else:
+            multiplier = 4
         chain_score[chain["upstream_account"]] += float(chain.get("confidence") or 0) * multiplier
     rows = []
     for account, profile in accounts.items():
@@ -456,25 +465,25 @@ def _source_chains(mentions: Sequence[dict], con: duckdb.DuckDBPyConnection) -> 
                 lead = (later_ts - earlier_ts).total_seconds() / 60
                 if lead > 24 * 60:
                     continue
-                evidence = "following_lead" if (later["account"], earlier["account"]) in following_edges else "same_narrative_lead"
-                key = (later["account"], earlier["account"], evidence)
-                current = chain_map.setdefault(
-                    key,
-                    {
-                        "downstream_account": later["account"],
-                        "upstream_account": earlier["account"],
-                        "evidence_type": evidence,
-                        "lead_time_minutes": lead,
-                        "shared_narratives": set(),
-                        "confidence": 0.0,
-                    },
-                )
-                current["lead_time_minutes"] = min(current["lead_time_minutes"], lead)
-                current["shared_narratives"].add(narrative)
-                current["confidence"] += 0.25 if evidence == "following_lead" else 0.04
+                for evidence in _chain_evidence_types(later, earlier, following_edges):
+                    key = (later["account"], earlier["account"], evidence)
+                    current = chain_map.setdefault(
+                        key,
+                        {
+                            "downstream_account": later["account"],
+                            "upstream_account": earlier["account"],
+                            "evidence_type": evidence,
+                            "lead_time_minutes": lead,
+                            "shared_narratives": set(),
+                            "confidence": 0.0,
+                        },
+                    )
+                    current["lead_time_minutes"] = min(current["lead_time_minutes"], lead)
+                    current["shared_narratives"].add(narrative)
+                    current["confidence"] += _chain_confidence_increment(evidence)
     chains = []
     for item in chain_map.values():
-        cap = 1.0 if item["evidence_type"] == "following_lead" else 0.35
+        cap = _chain_confidence_cap(item["evidence_type"])
         chains.append(
             {
                 **item,
@@ -483,6 +492,46 @@ def _source_chains(mentions: Sequence[dict], con: duckdb.DuckDBPyConnection) -> 
             }
         )
     return sorted(chains, key=lambda item: item["confidence"], reverse=True)
+
+
+def _chain_evidence_types(later: Mapping[str, object], earlier: Mapping[str, object], following_edges: set) -> List[str]:
+    evidence = []
+    if _references_post(later.get("referenced_tweets"), str(earlier.get("post_id") or "")):
+        evidence.append("post_reference_lead")
+    if (later["account"], earlier["account"]) in following_edges:
+        evidence.append("following_lead")
+    return evidence or ["same_narrative_lead"]
+
+
+def _references_post(referenced_tweets: object, post_id: str) -> bool:
+    if not post_id:
+        return False
+    if isinstance(referenced_tweets, str):
+        referenced_tweets = _loads(referenced_tweets, [])
+    if not isinstance(referenced_tweets, list):
+        return False
+    for item in referenced_tweets:
+        if isinstance(item, Mapping) and str(item.get("id") or "") == post_id:
+            return True
+        if str(item) == post_id:
+            return True
+    return False
+
+
+def _chain_confidence_increment(evidence_type: str) -> float:
+    if evidence_type == "following_lead":
+        return 0.25
+    if evidence_type == "post_reference_lead":
+        return 0.18
+    return 0.04
+
+
+def _chain_confidence_cap(evidence_type: str) -> float:
+    if evidence_type == "following_lead":
+        return 1.0
+    if evidence_type == "post_reference_lead":
+        return 0.8
+    return 0.35
 
 
 def _market_mentions(mentions: Sequence[dict], markets: Sequence[dict], keywords: Web3NarrativeKeywords) -> List[dict]:

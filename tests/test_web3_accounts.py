@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from typing import List, Optional
 
 from typer.testing import CliRunner
 
@@ -41,7 +42,14 @@ def test_rank_accounts_rewards_earliest_source_and_builds_source_chain(tmp_path)
         con,
         [
             _post("p1", "UpstreamAlpha", now - timedelta(hours=5), "Monad 空投 eligibility looks active", 8),
-            _post("p2", "BigInfluencer", now - timedelta(hours=3), "Monad airdrop claim narrative is spreading", 90),
+            _post(
+                "p2",
+                "BigInfluencer",
+                now - timedelta(hours=3),
+                "Monad airdrop claim narrative is spreading",
+                90,
+                referenced_tweets=[{"type": "quoted", "id": "p1"}],
+            ),
             _post("p3", "SpamPump", now - timedelta(minutes=58), "Monad airdrop airdrop airdrop", 1),
             _post("p4", "SpamPump", now - timedelta(minutes=48), "Monad airdrop pump again", 1),
             _post("p5", "SpamPump", now - timedelta(minutes=38), "Monad airdrop final call", 1),
@@ -70,9 +78,11 @@ def test_rank_accounts_rewards_earliest_source_and_builds_source_chain(tmp_path)
         select downstream_account, upstream_account, evidence_type
         from account_source_chains
         where downstream_account = 'BigInfluencer' and upstream_account = 'UpstreamAlpha'
+        order by evidence_type
         """
     ).fetchall()
-    assert chains == [("BigInfluencer", "UpstreamAlpha", "following_lead")]
+    assert ("BigInfluencer", "UpstreamAlpha", "following_lead") in chains
+    assert ("BigInfluencer", "UpstreamAlpha", "post_reference_lead") in chains
 
 
 def test_rank_accounts_uses_market_ticks_for_impact_score(tmp_path) -> None:
@@ -187,14 +197,21 @@ def _seed_accounts(con) -> None:
     )
 
 
-def _post(post_id: str, handle: str, created_at: datetime, text: str, reposts: int) -> dict:
+def _post(
+    post_id: str,
+    handle: str,
+    created_at: datetime,
+    text: str,
+    reposts: int,
+    referenced_tweets: Optional[List[dict]] = None,
+) -> dict:
     return {
         "post_id": post_id,
         "handle": handle,
         "created_at": created_at.isoformat(),
         "text": text,
         "public_metrics": {"retweet_count": reposts, "quote_count": 0},
-        "referenced_tweets": [],
+        "referenced_tweets": referenced_tweets or [],
         "lang": "en",
         "raw_json": {"id": post_id, "text": text},
     }

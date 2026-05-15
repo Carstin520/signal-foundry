@@ -50,6 +50,8 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             spread double,
             last_trade_price double,
             liquidity double,
+            tick_source varchar,
+            ingested_at timestamp,
             raw_json json
         )
         """
@@ -311,6 +313,74 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     )
     con.execute(
         """
+        create table if not exists event_cases (
+            case_id varchar primary key,
+            query varchar not null,
+            market_slug varchar,
+            start_at timestamp,
+            end_at timestamp,
+            keywords json,
+            status varchar,
+            created_at timestamp not null,
+            updated_at timestamp not null
+        )
+        """
+    )
+    con.execute(
+        """
+        create table if not exists event_case_posts (
+            case_id varchar not null,
+            post_id varchar not null,
+            handle varchar not null,
+            created_at timestamp not null,
+            text varchar,
+            direction varchar,
+            matched_keywords json,
+            raw_json_hash varchar not null,
+            raw_json json,
+            primary key (case_id, post_id)
+        )
+        """
+    )
+    con.execute(
+        """
+        create table if not exists event_post_impacts (
+            case_id varchar not null,
+            post_id varchar not null,
+            handle varchar not null,
+            market_slug varchar not null,
+            horizon varchar not null,
+            entry_mid double,
+            future_mid double,
+            delta double,
+            max_favorable_delta double,
+            max_adverse_delta double,
+            price_move_started_before_post boolean,
+            is_positive boolean,
+            is_strong boolean,
+            evaluated_at timestamp not null,
+            primary key (case_id, post_id, market_slug, horizon)
+        )
+        """
+    )
+    con.execute(
+        """
+        create table if not exists event_account_metrics (
+            account varchar not null,
+            case_id varchar not null,
+            lead_score double,
+            impact_score double,
+            hit_rate double,
+            false_fomo_rate double,
+            sample_size integer,
+            recommended_status varchar,
+            evaluated_at timestamp not null,
+            primary key (account, case_id)
+        )
+        """
+    )
+    con.execute(
+        """
         create table if not exists api_usage_log (
             service varchar not null,
             endpoint varchar not null,
@@ -331,6 +401,14 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             "hit_rate_72h": "double",
             "avg_favorable_move": "double",
             "avg_adverse_move": "double",
+        },
+    )
+    _ensure_columns(
+        con,
+        "market_ticks",
+        {
+            "tick_source": "varchar",
+            "ingested_at": "timestamp",
         },
     )
 
@@ -425,10 +503,24 @@ def insert_market_tick(
     con.execute(
         """
         insert into market_ticks
-        (observed_at, market_slug, token_id, best_bid, best_ask, mid, spread, last_trade_price, liquidity, raw_json)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (observed_at, market_slug, token_id, best_bid, best_ask, mid, spread, last_trade_price,
+         liquidity, tick_source, ingested_at, raw_json)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [observed_at, market_slug, token_id, best_bid, best_ask, mid, spread, last_trade_price, liquidity, json.dumps(raw, ensure_ascii=False)],
+        [
+            observed_at,
+            market_slug,
+            token_id,
+            best_bid,
+            best_ask,
+            mid,
+            spread,
+            last_trade_price,
+            liquidity,
+            "live",
+            utc_now_iso(),
+            json.dumps(raw, ensure_ascii=False),
+        ],
     )
 
 
@@ -444,11 +536,42 @@ def insert_market_midpoint_tick(
     con.execute(
         """
         insert into market_ticks
-        (observed_at, market_slug, token_id, best_bid, best_ask, mid, spread, last_trade_price, liquidity, raw_json)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (observed_at, market_slug, token_id, best_bid, best_ask, mid, spread, last_trade_price,
+         liquidity, tick_source, ingested_at, raw_json)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [observed_at, market_slug, token_id, None, None, mid, None, None, liquidity, json.dumps(raw, ensure_ascii=False)],
+        [observed_at, market_slug, token_id, None, None, mid, None, None, liquidity, "live", utc_now_iso(), json.dumps(raw, ensure_ascii=False)],
     )
+
+
+def insert_historical_price_ticks(con: duckdb.DuckDBPyConnection, rows_in: Iterable[dict]) -> int:
+    rows = [
+        (
+            row["observed_at"],
+            row.get("market_slug"),
+            row.get("token_id"),
+            _float_or_none(row.get("mid")),
+            _float_or_none(row.get("liquidity")),
+            row.get("tick_source") or "historical",
+            row.get("ingested_at") or utc_now_iso(),
+            json.dumps(row.get("raw") or row, ensure_ascii=False, sort_keys=True),
+        )
+        for row in rows_in
+        if row.get("observed_at") and row.get("token_id") and row.get("mid") is not None
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert into market_ticks
+        (observed_at, market_slug, token_id, best_bid, best_ask, mid, spread, last_trade_price,
+         liquidity, tick_source, ingested_at, raw_json)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [(observed_at, market_slug, token_id, None, None, mid, None, None, liquidity, tick_source, ingested_at, raw_json)
+         for observed_at, market_slug, token_id, mid, liquidity, tick_source, ingested_at, raw_json in rows],
+    )
+    return len(rows)
 
 
 def replace_wallet_activity(con: duckdb.DuckDBPyConnection, wallet: str, rows: Iterable[dict], fetched_at: Optional[str] = None) -> int:
@@ -901,6 +1024,133 @@ def upsert_signal_outcomes(con: duckdb.DuckDBPyConnection, outcomes: Iterable[di
         insert or replace into signal_outcomes
         (signal_id, horizon, entry_mid, future_mid, delta, max_favorable_delta,
          max_adverse_delta, overshoot, evaluated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def upsert_event_cases(con: duckdb.DuckDBPyConnection, cases: Iterable[dict], updated_at: Optional[str] = None) -> int:
+    now = updated_at or utc_now_iso()
+    rows = [
+        (
+            row["case_id"],
+            row["query"],
+            row.get("market_slug"),
+            row.get("start_at"),
+            row.get("end_at"),
+            json.dumps(row.get("keywords") or [], ensure_ascii=False),
+            row.get("status") or "active",
+            row.get("created_at") or now,
+            now,
+        )
+        for row in cases
+        if row.get("case_id") and row.get("query")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into event_cases
+        (case_id, query, market_slug, start_at, end_at, keywords, status, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def upsert_event_case_posts(con: duckdb.DuckDBPyConnection, posts: Iterable[dict]) -> int:
+    rows = [
+        (
+            post["case_id"],
+            str(post["post_id"]),
+            str(post["handle"]).lstrip("@"),
+            post["created_at"],
+            post.get("text", ""),
+            post.get("direction", "watch_only"),
+            json.dumps(post.get("matched_keywords") or [], ensure_ascii=False),
+            stable_hash(post.get("raw_json") or post),
+            json.dumps(post.get("raw_json") or post, ensure_ascii=False, sort_keys=True),
+        )
+        for post in posts
+        if post.get("case_id") and post.get("post_id") and post.get("handle") and post.get("created_at")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into event_case_posts
+        (case_id, post_id, handle, created_at, text, direction, matched_keywords, raw_json_hash, raw_json)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def upsert_event_post_impacts(con: duckdb.DuckDBPyConnection, impacts: Iterable[dict], evaluated_at: Optional[str] = None) -> int:
+    evaluated_at = evaluated_at or utc_now_iso()
+    rows = [
+        (
+            row["case_id"],
+            str(row["post_id"]),
+            str(row["handle"]).lstrip("@"),
+            row["market_slug"],
+            row["horizon"],
+            _float_or_none(row.get("entry_mid")),
+            _float_or_none(row.get("future_mid")),
+            _float_or_none(row.get("delta")),
+            _float_or_none(row.get("max_favorable_delta")),
+            _float_or_none(row.get("max_adverse_delta")),
+            bool(row.get("price_move_started_before_post")),
+            bool(row.get("is_positive")),
+            bool(row.get("is_strong")),
+            evaluated_at,
+        )
+        for row in impacts
+        if row.get("case_id") and row.get("post_id") and row.get("handle") and row.get("market_slug") and row.get("horizon")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into event_post_impacts
+        (case_id, post_id, handle, market_slug, horizon, entry_mid, future_mid, delta,
+         max_favorable_delta, max_adverse_delta, price_move_started_before_post,
+         is_positive, is_strong, evaluated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def upsert_event_account_metrics(con: duckdb.DuckDBPyConnection, metrics: Iterable[dict], evaluated_at: Optional[str] = None) -> int:
+    evaluated_at = evaluated_at or utc_now_iso()
+    rows = [
+        (
+            row["account"],
+            row["case_id"],
+            float(row.get("lead_score") or 0),
+            float(row.get("impact_score") or 0),
+            _float_or_none(row.get("hit_rate")),
+            _float_or_none(row.get("false_fomo_rate")),
+            int(row.get("sample_size") or 0),
+            row.get("recommended_status"),
+            evaluated_at,
+        )
+        for row in metrics
+        if row.get("account") and row.get("case_id")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into event_account_metrics
+        (account, case_id, lead_score, impact_score, hit_rate, false_fomo_rate,
+         sample_size, recommended_status, evaluated_at)
         values (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
