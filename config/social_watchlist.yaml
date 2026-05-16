@@ -14,11 +14,21 @@ categories:
       - mfa_russia
     source_score: 0
   elite_information:
-    handles: []
+    handles:
+      - lrozen
+      - BarakRavid
+      - ragipsoylu
+      - Joyce_Karam
+      - AmichaiStein1
     source_score: 25
   osint_geopolitics:
     handles:
       - PressTV
+      - JasonMBrodsky
+      - Faytuks
+      - ELINTNews
+      - sentdefender
+      - IranIntl_En
     source_score: 20
   polling_models:
     handles: []
