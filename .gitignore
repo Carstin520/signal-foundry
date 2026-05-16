@@ -12,3 +12,5 @@ __pycache__/
 data/
 *.duckdb
 *.duckdb.wal
+config/semantic_matching.yaml
+config/semantic_matching.local.yaml

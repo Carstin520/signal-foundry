@@ -4,23 +4,31 @@ import requests
 from typer.testing import CliRunner
 
 from quant_sol.signals.cli import app
-from quant_sol.signals.config import Web3AccountConfig
+from quant_sol.signals.config import SemanticMatchingConfig, Web3AccountConfig, load_semantic_matching_config
 from quant_sol.signals.history import (
+    DEFAULT_MICRO_HORIZONS,
     case_keywords,
     direction_from_text,
+    event_price_windows,
     matched_keywords,
     normalize_price_history,
     run_event_backtest,
     store_event_case_posts,
+    write_event_backtest_report,
     x_case_query,
 )
 from quant_sol.signals.models import MarketRecord
+from quant_sol.signals.semantic import HashingSemanticEncoder, match_event_posts_semantically, match_event_posts_with_cloud_model
 from quant_sol.signals.storage import (
     connect,
     insert_historical_price_ticks,
+    upsert_social_posts,
     upsert_event_cases,
+    upsert_live_burst_run,
     upsert_markets,
+    upsert_x_posts,
 )
+from quant_sol.signals.models import SocialPost
 
 
 def test_batch_prices_history_response_writes_historical_ticks(tmp_path) -> None:
@@ -36,6 +44,10 @@ def test_batch_prices_history_response_writes_historical_ticks(tmp_path) -> None
 
     assert count == 1
     assert stored == [("trump-china-visit", "yes-token", 0.42, "historical")]
+
+
+def test_micro_horizon_defaults_are_short_price_in_windows() -> None:
+    assert DEFAULT_MICRO_HORIZONS == ("1s", "10s", "30s", "1m", "5m", "10m", "30m", "2h")
 
 
 def test_trump_china_direction_keywords_support_english_and_chinese() -> None:
@@ -176,6 +188,182 @@ def test_ramp_backtest_uses_next_tick_entry_and_max_favorable_move(tmp_path) -> 
     assert impact["tradable_ramp"]
     assert impact["strong_ramp"]
     assert account["recommended_status"] == "ramp_source"
+
+
+def test_event_window_planner_merges_overlapping_post_windows(tmp_path) -> None:
+    con = connect(tmp_path / "windows.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    store_event_case_posts(
+        con,
+        "trump_china",
+        [
+            _post("p1", "Alpha", now + timedelta(minutes=30), "Trump may visit Beijing for a Xi summit"),
+            _post("p2", "Alpha", now + timedelta(minutes=35), "Trump may visit Beijing soon"),
+            _post("p3", "Beta", now + timedelta(hours=6), "Trump China visit odds are noisy"),
+        ],
+        ["trump", "china", "visit", "beijing", "summit"],
+    )
+
+    windows = event_price_windows(con, "trump_china", pre="10m", post="2h")
+
+    assert len(windows) == 2
+    assert windows[0][0] == now + timedelta(minutes=20)
+    assert windows[0][1] == now + timedelta(hours=2, minutes=35)
+
+
+def test_micro_backtest_scores_sub_10m_price_in(tmp_path) -> None:
+    con = connect(tmp_path / "micro.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    post_at = now + timedelta(minutes=1)
+    insert_historical_price_ticks(
+        con,
+        [
+            _tick(now, 0.40),
+            _tick(post_at + timedelta(seconds=1), 0.405, source="live_burst"),
+            _tick(post_at + timedelta(seconds=10), 0.41, source="live_burst"),
+            _tick(post_at + timedelta(seconds=30), 0.415, source="live_burst"),
+            _tick(post_at + timedelta(minutes=1), 0.42, source="live_burst"),
+            _tick(post_at + timedelta(minutes=5), 0.45, source="live_burst"),
+            _tick(post_at + timedelta(minutes=10), 0.455, source="live_burst"),
+            _tick(post_at + timedelta(minutes=30), 0.44, source="live_burst"),
+        ],
+    )
+    store_event_case_posts(
+        con,
+        "trump_china",
+        [_post("p1", "MicroAlpha", post_at, "Trump may visit Beijing for a Xi summit")],
+        ["trump", "china", "visit", "beijing", "summit"],
+    )
+
+    impacts, metrics = run_event_backtest(con, "trump_china", ["1m", "5m", "10m"], mode="micro")
+
+    five_min = [row for row in impacts if row["horizon"] == "5m"][0]
+    assert five_min["mode"] == "micro"
+    assert five_min["is_positive"]
+    assert five_min["tradable_ramp"]
+    assert five_min["time_to_3pp_seconds"] == 299
+    assert metrics[0]["recommended_status"] == "micro_source"
+    assert metrics[0]["sub_10m_hit_rate"] == 1
+
+
+def test_micro_backtest_marks_cost_erased_move_not_tradable(tmp_path) -> None:
+    con = connect(tmp_path / "micro_cost.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    post_at = now + timedelta(minutes=1)
+    rows = [
+        (now, 0.39, 0.41, 0.40, "live_burst"),
+        (post_at + timedelta(seconds=1), 0.38, 0.42, 0.40, "live_burst"),
+        (post_at + timedelta(minutes=5), 0.415, 0.455, 0.435, "live_burst"),
+    ]
+    for observed_at, bid, ask, mid, source in rows:
+        con.execute(
+            """
+            insert into market_ticks
+            (observed_at, market_slug, token_id, best_bid, best_ask, mid, spread,
+             last_trade_price, liquidity, tick_source, ingested_at, raw_json)
+            values (?, 'will-trump-visit-china', 'yes-token', ?, ?, ?, ?, null,
+                    100000, ?, current_timestamp, '{}')
+            """,
+            [observed_at.isoformat(), bid, ask, mid, ask - bid, source],
+        )
+    store_event_case_posts(
+        con,
+        "trump_china",
+        [_post("p1", "CostAlpha", post_at, "Trump may visit Beijing for a Xi summit")],
+        ["trump", "china", "visit", "beijing", "summit"],
+    )
+
+    impacts, metrics = run_event_backtest(con, "trump_china", ["5m"], mode="micro")
+
+    impact = impacts[0]
+    assert impact["is_positive"]
+    assert not impact["paper_trade_positive"]
+    assert not impact["tradable_ramp"]
+    assert impact["execution_cost"] > 0.03
+    assert impact["net_max_favorable_delta"] < 0.03
+    assert "cost_erased_move" in impact["risk_tags"]
+    assert "high_execution_cost" in impact["risk_tags"]
+    assert metrics[0]["recommended_status"] == "cost_erased_watch"
+
+
+def test_micro_backtest_marks_minute_floor_for_sub_minute_history(tmp_path) -> None:
+    con = connect(tmp_path / "minute_floor.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    post_at = now + timedelta(minutes=1)
+    insert_historical_price_ticks(
+        con,
+        [
+            _tick(now, 0.40),
+            _tick(post_at, 0.40),
+            _tick(post_at + timedelta(minutes=1), 0.44),
+            _tick(post_at + timedelta(minutes=5), 0.46),
+        ],
+    )
+    store_event_case_posts(
+        con,
+        "trump_china",
+        [_post("p1", "MinuteAlpha", post_at, "Trump may visit Beijing for a Xi summit")],
+        ["trump", "china", "visit", "beijing", "summit"],
+    )
+
+    impacts, metrics = run_event_backtest(con, "trump_china", ["10s", "1m", "5m"], mode="micro")
+
+    ten_sec = [row for row in impacts if row["horizon"] == "10s"][0]
+    one_min = [row for row in impacts if row["horizon"] == "1m"][0]
+    assert "minute_floor" in ten_sec["risk_tags"]
+    assert "insufficient_resolution" in ten_sec["risk_tags"]
+    assert not ten_sec["is_positive"]
+    assert one_min["is_positive"]
+    assert metrics[0]["recommended_status"] in {"micro_source", "watch"}
+
+
+def test_live_micro_evidence_report_uses_burst_runs(tmp_path) -> None:
+    con = connect(tmp_path / "live_report.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    post_at = now + timedelta(minutes=1)
+    insert_historical_price_ticks(
+        con,
+        [
+            _tick(now, 0.40, source="live_burst"),
+            _tick(post_at + timedelta(seconds=1), 0.405, source="live_burst"),
+            _tick(post_at + timedelta(seconds=10), 0.41, source="live_burst"),
+            _tick(post_at + timedelta(seconds=30), 0.415, source="live_burst"),
+            _tick(post_at + timedelta(minutes=1), 0.42, source="live_burst"),
+            _tick(post_at + timedelta(minutes=5), 0.45, source="live_burst"),
+            _tick(post_at + timedelta(minutes=10), 0.455, source="live_burst"),
+        ],
+    )
+    store_event_case_posts(
+        con,
+        "trump_china",
+        [_post("p1", "MicroAlpha", post_at, "Trump may visit Beijing for a Xi summit")],
+        ["trump", "china", "visit", "beijing", "summit"],
+    )
+    upsert_live_burst_run(
+        con,
+        {
+            "case_id": "trump_china",
+            "post_id": "p1",
+            "handle": "MicroAlpha",
+            "confidence": 0.91,
+            "status": "completed",
+            "planned_calls": 7,
+            "ticks_written": 7,
+        },
+    )
+    run_event_backtest(con, "trump_china", ["1s", "10s", "30s", "1m", "5m", "10m"], mode="micro")
+
+    path = write_event_backtest_report(con, "trump_china", tmp_path)
+    text = path.read_text(encoding="utf-8")
+
+    assert "## Live Micro Evidence" in text
+    assert "p1" in text
+    assert "MicroAlpha" in text
 
 
 def test_ramp_hit_survives_close_reversal(tmp_path) -> None:
@@ -332,6 +520,267 @@ def test_backfill_x_history_stops_when_full_archive_unavailable(tmp_path, monkey
     assert "full-archive search is unavailable" in result.stdout
 
 
+def test_semantic_matcher_adds_multilingual_event_posts(tmp_path, monkeypatch) -> None:
+    con = connect(tmp_path / "semantic.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    upsert_x_posts(
+        con,
+        [
+            {
+                "post_id": "s1",
+                "handle": "FastSource",
+                "created_at": (now + timedelta(minutes=5)).isoformat(),
+                "text": "和平协议 停火 谈判 正在推动市场情绪",
+                "public_metrics": {},
+                "referenced_tweets": [],
+                "lang": "zh",
+                "raw_json": {},
+            },
+            {
+                "post_id": "s2",
+                "handle": "Noise",
+                "created_at": (now + timedelta(minutes=6)).isoformat(),
+                "text": "football celebrity entertainment update",
+                "public_metrics": {},
+                "referenced_tweets": [],
+                "lang": "en",
+                "raw_json": {},
+            },
+        ],
+    )
+    monkeypatch.setattr("quant_sol.signals.semantic._SentenceTransformerEncoder", lambda _name: HashingSemanticEncoder())
+    config = SemanticMatchingConfig(
+        model_name="test",
+        similarity_threshold=0.2,
+        max_posts=100,
+        keyword_fallback=True,
+        cloud_provider="openai",
+        cloud_model="test",
+        cloud_max_posts_per_request=20,
+        cloud_api_key_env="OPENAI_API_KEY",
+        case_seed_concepts={"default": ("和平协议 停火 谈判", "peace deal ceasefire talks")},
+        case_exclude_concepts={"default": ("football celebrity entertainment",)},
+    )
+
+    result = match_event_posts_semantically(con, "trump_china", config)
+
+    assert result.unavailable_reason is None
+    assert result.matches_written == 1
+    assert result.posts_added == 1
+    stored = con.execute("select handle, matched_keywords from event_case_posts where case_id='trump_china' and post_id='s1'").fetchone()
+    assert stored[0] == "FastSource"
+    assert "semantic:" in stored[1]
+
+
+def test_match_event_posts_warns_when_semantic_dependency_missing(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    con = connect(tmp_path / "data" / "quant_sol.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    upsert_event_cases(
+        con,
+        [
+            {
+                "case_id": "trump_china",
+                "query": "Trump China visit",
+                "market_slug": "will-trump-visit-china",
+                "start_at": now.isoformat(),
+                "end_at": (now + timedelta(days=1)).isoformat(),
+                "keywords": ["trump", "china", "visit"],
+                "status": "active",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "quant_sol.signals.semantic._SentenceTransformerEncoder",
+        lambda _name: (_ for _ in ()).throw(RuntimeError("missing model")),
+    )
+
+    result = CliRunner().invoke(app, ["match-event-posts", "--case", "trump_china"])
+
+    assert result.exit_code == 0
+    assert "semantic_model_unavailable" in result.stdout
+
+
+def test_cloud_matcher_requires_api_key(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    con = connect(tmp_path / "cloud_missing.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    config = _semantic_config()
+
+    result = match_event_posts_with_cloud_model(con, "trump_china", config, api_key="")
+
+    assert result.unavailable_reason == "OPENAI_API_KEY is not set"
+
+
+def test_cloud_matcher_writes_model_matches(tmp_path, monkeypatch) -> None:
+    con = connect(tmp_path / "cloud.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    upsert_x_posts(
+        con,
+        [
+            {
+                "post_id": "c1",
+                "handle": "CloudSource",
+                "created_at": (now + timedelta(minutes=5)).isoformat(),
+                "text": "Iran ceasefire talks could support a permanent peace agreement",
+                "public_metrics": {},
+                "referenced_tweets": [],
+                "lang": "en",
+                "raw_json": {},
+            }
+        ],
+    )
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "output_text": (
+                    '{"matches":[{"post_id":"c1","match":true,"confidence":0.91,'
+                    '"direction":"bullish","matched_concepts":["peace deal"]}]}'
+                )
+            }
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+            self.payload = None
+
+        def post(self, url, json, timeout):
+            self.payload = json
+            return FakeResponse()
+
+    monkeypatch.setattr("quant_sol.signals.semantic.requests.Session", FakeSession)
+
+    result = match_event_posts_with_cloud_model(con, "trump_china", _semantic_config(), api_key="test-key", base_url="https://example.test")
+
+    assert result.unavailable_reason is None
+    assert result.matches_written == 1
+    assert result.posts_added == 1
+    stored = con.execute("select direction, matched_keywords from event_case_posts where case_id='trump_china' and post_id='c1'").fetchone()
+    assert stored[0] == "bullish"
+    assert "cloud:peace deal" in stored[1]
+
+
+def test_cloud_matcher_can_use_social_posts_candidates(tmp_path, monkeypatch) -> None:
+    con = connect(tmp_path / "cloud_social.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    upsert_social_posts(
+        con,
+        [
+            SocialPost(
+                platform="x",
+                handle="SocialSource",
+                post_id="sp1",
+                created_at=(now + timedelta(minutes=5)).isoformat(),
+                text="Iran ceasefire talks could support a permanent peace agreement",
+                url="https://x.com/SocialSource/status/sp1",
+                raw={},
+            )
+        ],
+    )
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "output_text": (
+                    '{"matches":[{"post_id":"sp1","match":true,"confidence":0.9,'
+                    '"direction":"bullish","matched_concepts":["peace deal"]}]}'
+                )
+            }
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+
+        def post(self, url, json, timeout):
+            return FakeResponse()
+
+    monkeypatch.setattr("quant_sol.signals.semantic.requests.Session", FakeSession)
+
+    result = match_event_posts_with_cloud_model(con, "trump_china", _semantic_config(), api_key="test-key", base_url="https://example.test")
+
+    assert result.matches_written == 1
+    assert result.posts_added == 1
+
+
+def test_cloud_matcher_returns_warning_on_rate_limit(tmp_path, monkeypatch) -> None:
+    con = connect(tmp_path / "cloud_429.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    upsert_x_posts(
+        con,
+        [
+            {
+                "post_id": "c1",
+                "handle": "CloudSource",
+                "created_at": (now + timedelta(minutes=5)).isoformat(),
+                "text": "Iran ceasefire talks could support a permanent peace agreement",
+                "public_metrics": {},
+                "referenced_tweets": [],
+                "lang": "en",
+                "raw_json": {},
+            }
+        ],
+    )
+
+    class RateLimitedResponse:
+        status_code = 429
+
+        def raise_for_status(self):
+            import requests
+
+            raise requests.HTTPError("too many requests", response=self)
+
+    class FakeSession:
+        def __init__(self):
+            self.headers = {}
+
+        def post(self, url, json, timeout):
+            return RateLimitedResponse()
+
+    monkeypatch.setattr("quant_sol.signals.semantic.requests.Session", FakeSession)
+
+    result = match_event_posts_with_cloud_model(con, "trump_china", _semantic_config(), api_key="test-key", base_url="https://example.test")
+
+    assert result.matches_written == 0
+    assert "status=429" in result.unavailable_reason
+
+
+def test_semantic_config_supports_top_level_cloud(tmp_path) -> None:
+    path = tmp_path / "semantic.yaml"
+    path.write_text(
+        """
+model:
+  name: local-model
+  similarity_threshold: 0.61
+cloud:
+  provider: openai
+  model: gpt-test
+  max_posts_per_request: 7
+  api_key_env: sk-test-inline-key
+cases: {}
+""",
+        encoding="utf-8",
+    )
+
+    config = load_semantic_matching_config(path)
+
+    assert config.cloud_provider == "openai"
+    assert config.cloud_model == "gpt-test"
+    assert config.cloud_max_posts_per_request == 7
+    assert config.cloud_api_key_env == "sk-test-inline-key"
+
+
 def _post(post_id: str, handle: str, created_at: datetime, text: str) -> dict:
     return {
         "post_id": post_id,
@@ -340,6 +789,21 @@ def _post(post_id: str, handle: str, created_at: datetime, text: str) -> dict:
         "text": text,
         "raw_json": {"id": post_id, "text": text},
     }
+
+
+def _semantic_config() -> SemanticMatchingConfig:
+    return SemanticMatchingConfig(
+        model_name="test",
+        similarity_threshold=0.2,
+        max_posts=100,
+        keyword_fallback=True,
+        cloud_provider="openai",
+        cloud_model="gpt-5-nano",
+        cloud_max_posts_per_request=20,
+        cloud_api_key_env="OPENAI_API_KEY",
+        case_seed_concepts={"default": ("和平协议 停火 谈判", "peace deal ceasefire talks")},
+        case_exclude_concepts={"default": ("football celebrity entertainment",)},
+    )
 
 
 def _seed_case(con, now: datetime) -> None:
@@ -376,12 +840,13 @@ def _seed_case(con, now: datetime) -> None:
     )
 
 
-def _tick(observed_at: datetime, mid: float) -> dict:
+def _tick(observed_at: datetime, mid: float, source: str = "historical") -> dict:
     return {
         "observed_at": observed_at.isoformat(),
         "market_slug": "will-trump-visit-china",
         "token_id": "yes-token",
         "mid": mid,
         "liquidity": 100_000,
+        "tick_source": source,
         "raw": {},
     }

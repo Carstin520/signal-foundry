@@ -17,6 +17,7 @@ FOMO_MODEL_PATH = CONFIG_ROOT / "fomo_model.yaml"
 WEB3_ACCOUNT_WATCHLIST_PATH = CONFIG_ROOT / "web3_account_watchlist.yaml"
 WEB3_NARRATIVE_KEYWORDS_PATH = CONFIG_ROOT / "web3_narrative_keywords.yaml"
 API_LIMITS_PATH = CONFIG_ROOT / "api_limits.yaml"
+SEMANTIC_MATCHING_PATH = CONFIG_ROOT / "semantic_matching.yaml"
 SIGNAL_RAW_ROOT = DATA_ROOT / "raw" / "signals"
 SIGNAL_REPORT_ROOT = DATA_ROOT / "reports"
 
@@ -92,6 +93,20 @@ class XApiLimits:
     sync_accounts_max_posts_per_account: int
     sync_follow_graph_max_accounts: int
     sync_follow_graph_max_following_per_account: int
+
+
+@dataclass(frozen=True)
+class SemanticMatchingConfig:
+    model_name: str
+    similarity_threshold: float
+    max_posts: int
+    keyword_fallback: bool
+    cloud_provider: str
+    cloud_model: str
+    cloud_max_posts_per_request: int
+    cloud_api_key_env: str
+    case_seed_concepts: Mapping[str, Tuple[str, ...]]
+    case_exclude_concepts: Mapping[str, Tuple[str, ...]]
 
 
 def load_yaml(path: Path) -> dict:
@@ -225,13 +240,41 @@ def load_x_api_limits(path: Path = API_LIMITS_PATH) -> XApiLimits:
     sync_accounts = x_config.get("sync_accounts") if isinstance(x_config.get("sync_accounts"), dict) else {}
     sync_follow_graph = x_config.get("sync_follow_graph") if isinstance(x_config.get("sync_follow_graph"), dict) else {}
     return XApiLimits(
-        daily_call_cap=int(x_config.get("daily_call_cap", 80)),
+        daily_call_cap=int(x_config.get("daily_call_cap", 200)),
         sync_social_max_handles=int(sync_social.get("max_handles", 10)),
         sync_social_max_posts_per_handle=int(sync_social.get("max_posts_per_handle", 20)),
         sync_accounts_max_accounts=int(sync_accounts.get("max_accounts", 5)),
         sync_accounts_max_posts_per_account=int(sync_accounts.get("max_posts_per_account", 20)),
         sync_follow_graph_max_accounts=int(sync_follow_graph.get("max_accounts", 3)),
         sync_follow_graph_max_following_per_account=int(sync_follow_graph.get("max_following_per_account", 50)),
+    )
+
+
+def load_semantic_matching_config(path: Path = SEMANTIC_MATCHING_PATH) -> SemanticMatchingConfig:
+    payload = load_yaml(path)
+    model = payload.get("model") if isinstance(payload.get("model"), dict) else {}
+    cloud = payload.get("cloud") if isinstance(payload.get("cloud"), dict) else {}
+    if not cloud:
+        cloud = model.get("cloud") if isinstance(model.get("cloud"), dict) else {}
+    cases = payload.get("cases") if isinstance(payload.get("cases"), dict) else {}
+    seed_concepts: Dict[str, Tuple[str, ...]] = {}
+    exclude_concepts: Dict[str, Tuple[str, ...]] = {}
+    for case_id, config in cases.items():
+        if not isinstance(config, dict):
+            continue
+        seed_concepts[str(case_id)] = tuple(_strings(config.get("seed_concepts")))
+        exclude_concepts[str(case_id)] = tuple(_strings(config.get("exclude_concepts")))
+    return SemanticMatchingConfig(
+        model_name=str(model.get("name") or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"),
+        similarity_threshold=float(model.get("similarity_threshold", 0.55)),
+        max_posts=int(model.get("max_posts", 5000)),
+        keyword_fallback=bool(model.get("keyword_fallback", True)),
+        cloud_provider=str(cloud.get("provider") or "openai"),
+        cloud_model=str(cloud.get("model") or "gpt-5-nano"),
+        cloud_max_posts_per_request=int(cloud.get("max_posts_per_request", 20)),
+        cloud_api_key_env=str(cloud.get("api_key_env") or "OPENAI_API_KEY"),
+        case_seed_concepts=seed_concepts,
+        case_exclude_concepts=exclude_concepts,
     )
 
 

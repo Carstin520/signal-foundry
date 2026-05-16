@@ -10,6 +10,7 @@ from typing import Optional
 import typer
 from requests import RequestException
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from .accounts import (
@@ -26,6 +27,7 @@ from .config import (
     SIGNAL_REPORT_ROOT,
     load_fomo_config,
     load_market_rules,
+    load_semantic_matching_config,
     load_social_handles,
     load_wallet_watchlist,
     load_web3_accounts,
@@ -35,9 +37,17 @@ from .config import (
 )
 from .env import has_secret, load_local_env, masked_secret
 from .diagnostics import model_diagnostics, write_model_diagnostics
+from .discovery import (
+    discover_signal_source_candidates,
+    planned_x_calls_for_discovery,
+    write_signal_discovery_report,
+)
 from .history import (
+    DEFAULT_HORIZONS,
+    DEFAULT_MICRO_HORIZONS,
     case_keywords,
     discover_event_case as discover_event_case_record,
+    event_price_windows,
     event_case_token_rows,
     get_event_case,
     normalize_price_history,
@@ -55,21 +65,26 @@ from .storage import (
     alerted_signal_ids,
     connect,
     insert_market_midpoint_tick,
+    insert_market_midpoint_tick_with_source,
     insert_historical_price_ticks,
     insert_market_tick,
+    live_burst_run_exists,
+    live_burst_trigger_candidates,
     record_api_call,
     record_telegram_alert,
     replace_wallet_activity,
     save_raw_payload,
     upsert_markets,
+    upsert_live_burst_run,
     upsert_signal_events,
     upsert_social_posts,
     upsert_x_accounts,
     upsert_x_follow_graph,
     upsert_x_posts,
 )
+from .semantic import match_event_posts_semantically, match_event_posts_with_cloud_model
 from .telegram import TelegramClient, format_alert
-from .utils import first_float, first_text, parse_timestamp, utc_now_iso
+from .utils import first_float, first_text, parse_timestamp, stable_hash, utc_now_iso
 
 
 app = typer.Typer(help="Read-only prediction-market information arbitrage Research OS.")
@@ -90,6 +105,52 @@ def discover_markets(
     count = upsert_markets(con, records)
     save_raw_payload("gamma_markets", category, [record.raw for record in records])
     console.print(f"Discovered {count} {category} market(s).")
+
+
+@app.command("discover-signal-sources")
+def discover_signal_sources(
+    max_markets: int = typer.Option(8, "--max-markets", help="Maximum high-interest live markets to scan."),
+    max_gamma_pages: int = typer.Option(2, "--max-gamma-pages", help="Gamma API pages to scan."),
+    min_liquidity: float = typer.Option(100_000, "--min-liquidity", help="Minimum liquidity or volume threshold."),
+    focus: str = typer.Option("narrative", "--focus", help="Market focus: narrative, politics, crypto, sports, or all."),
+    lookback: str = typer.Option("24h", "--lookback", help="X/reddit discovery lookback window."),
+    max_posts_per_market: int = typer.Option(20, "--max-posts-per-market", help="Maximum X posts requested per market."),
+    daily_cap: Optional[int] = typer.Option(None, "--daily-cap", help="Local daily X API call cap."),
+    include_reddit: bool = typer.Option(True, "--include-reddit/--no-reddit", help="Use public Reddit search as low-confidence context."),
+    reddit_limit: int = typer.Option(5, "--reddit-limit", help="Maximum Reddit context posts per market."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Plan market and X API usage without external X/reddit searches."),
+) -> None:
+    """Find high-interest open Polymarket pools and candidate X accounts to add as signal sources."""
+    con = connect()
+    limits = load_x_api_limits()
+    cap = daily_cap or limits.daily_call_cap
+    planned_x_calls = planned_x_calls_for_discovery(max_markets)
+    token = os.getenv("X_BEARER_TOKEN")
+    if token and not _check_x_budget(con, planned_x_calls, cap, dry_run, f"discover-signal-sources markets={max_markets}"):
+        return
+    if not token:
+        console.print("[yellow]X_BEARER_TOKEN is not set. Market discovery will run without X source search.[/yellow]")
+    result = discover_signal_source_candidates(
+        con,
+        XApiClient(token) if token and not dry_run else None,
+        max_markets=max_markets,
+        max_gamma_pages=max_gamma_pages,
+        min_liquidity=min_liquidity,
+        focus=focus,
+        lookback_seconds=parse_duration(lookback),
+        max_posts_per_market=max_posts_per_market,
+        include_reddit=include_reddit and not dry_run,
+        reddit_limit=reddit_limit,
+        dry_run=dry_run,
+    )
+    _render_signal_discovery(result)
+    if dry_run:
+        console.print("Dry run only: no X/reddit discovery report written.")
+        return
+    if token:
+        record_api_call(con, "x", "tweets/search/recent", call_count=int(result.get("planned_x_calls") or 0), notes="discover-signal-sources")
+    path = write_signal_discovery_report(result, SIGNAL_REPORT_ROOT)
+    console.print(f"Wrote signal discovery report: {path}")
 
 
 @app.command("sync-social")
@@ -465,6 +526,10 @@ def backfill_market_history(
     case: str = typer.Option(..., "--case", help="Historical event case id."),
     interval: str = typer.Option("1m", "--interval", help="Polymarket history interval: 1m, 1h, 6h, 1d, 1w, all, max."),
     fidelity: int = typer.Option(1, "--fidelity", help="History fidelity in minutes."),
+    target: str = typer.Option("full", "--target", help="Price history target: full or event-windows."),
+    pre: str = typer.Option("10m", "--pre", help="Event-window lookback when --target event-windows."),
+    post: str = typer.Option("2h", "--post", help="Event-window lookahead when --target event-windows."),
+    max_windows: int = typer.Option(200, "--max-windows", help="Maximum merged event windows to request."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show request plan without calling CLOB."),
 ) -> None:
     """Backfill Polymarket historical prices for an event case."""
@@ -479,29 +544,38 @@ def backfill_market_history(
     if not token_rows or start_dt is None or end_dt is None:
         console.print("[yellow]Case is missing market token ids or valid time window.[/yellow]")
         return
-    planned_calls = len(_chunks(token_rows, 20))
+    if target not in {"full", "event-windows"}:
+        console.print("[yellow]Unsupported target. Use full or event-windows.[/yellow]")
+        return
+    windows = [(start_dt, end_dt)] if target == "full" else event_price_windows(con, case, pre=pre, post=post, max_windows=max_windows)
+    planned_calls = len(windows) * len(_chunks(token_rows, 20))
     console.print(
         f"Polymarket history plan: case={case}, market={case_row['market_slug']}, "
-        f"tokens={len(token_rows)}, requests={planned_calls}, interval={interval}, fidelity={fidelity}"
+        f"tokens={len(token_rows)}, target={target}, windows={len(windows)}, requests={planned_calls}, "
+        f"interval={interval}, fidelity={fidelity}"
     )
+    if not windows:
+        console.print("[yellow]No event windows found. Run backfill-x-history or match-event-posts first.[/yellow]")
+        return
     if dry_run:
         console.print("Dry run only: no CLOB calls made.")
         return
     client = CLOBClient()
     total = 0
-    for chunk in _chunks(token_rows, 20):
-        token_ids = [row["token_id"] for row in chunk]
-        payload = client.batch_prices_history(
-            token_ids,
-            start_ts=int(start_dt.timestamp()),
-            end_ts=int(end_dt.timestamp()),
-            interval=interval,
-            fidelity=fidelity,
-        )
-        save_raw_payload("polymarket_price_history", case, payload)
-        token_to_market = {row["token_id"]: row for row in chunk}
-        rows = normalize_price_history(payload, token_to_market)
-        total += insert_historical_price_ticks(con, rows)
+    for window_index, (window_start, window_end) in enumerate(windows):
+        for chunk in _chunks(token_rows, 20):
+            token_ids = [row["token_id"] for row in chunk]
+            payload = client.batch_prices_history(
+                token_ids,
+                start_ts=int(window_start.timestamp()),
+                end_ts=int(window_end.timestamp()),
+                interval=interval,
+                fidelity=fidelity,
+            )
+            save_raw_payload("polymarket_price_history", f"{case}_{target}_{window_index}", payload)
+            token_to_market = {row["token_id"]: row for row in chunk}
+            rows = normalize_price_history(payload, token_to_market, tick_source="historical_targeted" if target == "event-windows" else "historical")
+            total += insert_historical_price_ticks(con, rows)
     console.print(f"Backfilled {total} historical price tick(s).")
 
 
@@ -575,16 +649,39 @@ def backfill_x_history(
 @app.command("run-event-backtest")
 def run_event_backtest(
     case: str = typer.Option(..., "--case", help="Historical event case id."),
-    horizons: str = typer.Option("1h,6h,24h,72h", "--horizons", help="Comma-separated horizons."),
-    mode: str = typer.Option("ramp", "--mode", help="Backtest mode: ramp, volatility, or event."),
+    horizons: str = typer.Option("", "--horizons", help="Comma-separated horizons. Defaults depend on mode."),
+    mode: str = typer.Option("micro", "--mode", help="Backtest mode: micro, ramp, volatility, or event."),
 ) -> None:
     """Run post-level event-study backtest for an event case."""
-    if mode not in {"ramp", "volatility", "event"}:
-        console.print(f"[yellow]Unsupported mode '{mode}'. Use ramp, volatility, or event.[/yellow]")
+    if mode not in {"micro", "ramp", "volatility", "event"}:
+        console.print(f"[yellow]Unsupported mode '{mode}'. Use micro, ramp, volatility, or event.[/yellow]")
         return
-    horizon_values = [part.strip() for part in horizons.split(",") if part.strip()]
+    if horizons.strip():
+        horizon_values = [part.strip() for part in horizons.split(",") if part.strip()]
+    else:
+        horizon_values = list(DEFAULT_MICRO_HORIZONS if mode == "micro" else DEFAULT_HORIZONS)
     impacts, metrics = run_event_backtest_case(connect(), case, horizon_values, mode=mode)
     console.print(f"Backtested {len(impacts)} {mode} post impact row(s); wrote {len(metrics)} account metric row(s).")
+
+
+@app.command("match-event-posts")
+def match_event_posts(
+    case: str = typer.Option(..., "--case", help="Historical event case id."),
+    method: str = typer.Option("semantic", "--method", help="Matching method: semantic or cloud."),
+) -> None:
+    """Match locally stored X posts to an event case with local semantic embeddings."""
+    if method not in {"semantic", "cloud"}:
+        console.print("[yellow]Unsupported method. V1 supports semantic or cloud.[/yellow]")
+        return
+    config = load_semantic_matching_config()
+    if method == "cloud":
+        result = match_event_posts_with_cloud_model(connect(), case, config)
+    else:
+        result = match_event_posts_semantically(connect(), case, config, method=method)
+    if result.unavailable_reason:
+        console.print(f"[yellow]{escape(result.unavailable_reason)}. Falling back to existing keyword-matched event posts.[/yellow]")
+        return
+    console.print(f"{method} matched {result.matches_written} post-market row(s); added {result.posts_added} event case post(s).")
 
 
 @app.command("report-event-backtest")
@@ -656,7 +753,18 @@ def stream_market(
         best_ask = first_float(payload, "best_ask", "ask", "bestAsk")
         last_trade = first_float(payload, "price", "last_trade_price", "lastTradePrice")
         market_slug = token_to_market.get(str(token_id))
-        insert_market_tick(con, parse_timestamp(payload.get("timestamp")) or utc_now_iso(), market_slug, token_id, best_bid, best_ask, last_trade, None, payload)
+        insert_market_tick(
+            con,
+            parse_timestamp(payload.get("timestamp")) or utc_now_iso(),
+            market_slug,
+            token_id,
+            best_bid,
+            best_ask,
+            last_trade,
+            None,
+            payload,
+            tick_source="live_websocket",
+        )
 
     CLOBWebSocket().stream(list(token_to_market), on_message=on_message, seconds=seconds)
     console.print(f"Streamed CLOB updates for {seconds}s from {len(token_to_market)} token(s).")
@@ -721,6 +829,136 @@ def collect_market_ticks(
         if index < iterations - 1:
             time.sleep(interval_seconds)
     console.print(f"Collected {total} CLOB midpoint tick(s) across {iterations} iteration(s).")
+
+
+@app.command("collect-market-burst")
+def collect_market_burst(
+    case: Optional[str] = typer.Option(None, "--case", help="Historical/live event case id."),
+    cases: Optional[str] = typer.Option(None, "--cases", help="Comma-separated event case ids. Overrides --case."),
+    trigger_post_id: Optional[str] = typer.Option(None, "--trigger-post-id", help="Optional triggering post id for run de-duplication."),
+    trigger_handle: Optional[str] = typer.Option(None, "--trigger-handle", help="Optional triggering handle for audit records."),
+    trigger_confidence: Optional[float] = typer.Option(None, "--trigger-confidence", help="Optional trigger confidence for audit records."),
+    fast_seconds: int = typer.Option(60, "--fast-seconds", help="Initial 1s collection duration."),
+    medium_seconds: int = typer.Option(600, "--medium-seconds", help="10s collection duration after fast phase."),
+    slow_seconds: int = typer.Option(6600, "--slow-seconds", help="60s collection duration after medium phase."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show bounded burst plan without calling CLOB."),
+) -> None:
+    """Collect bounded post-event burst midpoint snapshots for one case."""
+    con = connect()
+    case_ids = _case_ids_from_options(case, cases)
+    if not case_ids:
+        console.print("[yellow]Provide --case or --cases.[/yellow]")
+        return
+    phases = [
+        ("1s", 1, max(0, fast_seconds)),
+        ("10s", 10, max(0, medium_seconds)),
+        ("1m", 60, max(0, slow_seconds)),
+    ]
+    iterations = [(label, interval, seconds // interval if interval else 0) for label, interval, seconds in phases]
+    plans = []
+    for case_id in case_ids:
+        markets, token_rows = _market_tick_plan(con, "all", 1, case=case_id)
+        plans.append((case_id, markets, token_rows))
+    planned_calls = sum(len(token_rows) * sum(count for _, _, count in iterations) for _, _, token_rows in plans)
+    console.print(
+        f"Polymarket burst plan: cases={len(case_ids)}, "
+        f"phases={iterations}, planned_calls={planned_calls}"
+    )
+    if dry_run:
+        console.print("Dry run only: no CLOB calls made.")
+        return
+    for case_id, markets, token_rows in plans:
+        total += _collect_burst_for_case(
+            con,
+            case_id,
+            token_rows,
+            iterations,
+            trigger_post_id=trigger_post_id,
+            trigger_handle=trigger_handle,
+            trigger_confidence=trigger_confidence,
+        )
+    console.print(f"Collected {total} burst midpoint tick(s).")
+
+
+@app.command("monitor-event-live")
+def monitor_event_live(
+    cases: str = typer.Option(..., "--cases", help="Comma-separated event case ids."),
+    poll_seconds: int = typer.Option(60, "--poll-seconds", help="Seconds between monitor loops."),
+    iterations: int = typer.Option(1, "--iterations", help="Bounded monitor loop count."),
+    max_handles: int = typer.Option(17, "--max-handles", help="Maximum X handles to backfill per loop."),
+    max_posts_per_handle: int = typer.Option(20, "--max-posts-per-handle", help="Maximum posts per handle per loop."),
+    daily_x_cap: int = typer.Option(200, "--daily-x-cap", help="Local daily X API call cap."),
+    min_confidence: float = typer.Option(0.70, "--min-confidence", help="Minimum cloud match confidence to trigger burst."),
+    max_trigger_age: str = typer.Option("10m", "--max-trigger-age", help="Only trigger burst from posts newer than this duration."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show monitor actions without calling external APIs or writing burst runs."),
+) -> None:
+    """Monitor event cases and trigger live micro burst collection from high-confidence cloud matches."""
+    con = connect()
+    case_ids = _case_ids_from_options(None, cases)
+    if not case_ids:
+        console.print("[yellow]No cases supplied.[/yellow]")
+        return
+    max_trigger_age_seconds = parse_duration(max_trigger_age)
+    for loop_index in range(max(1, iterations)):
+        loop_started_at = utc_now_iso()
+        min_post_created_at = (datetime.now(timezone.utc) - timedelta(seconds=max_trigger_age_seconds)).isoformat()
+        baseline_calls = 0
+        for case_id in case_ids:
+            _, token_rows = _market_tick_plan(con, "all", 1, case=case_id)
+            baseline_calls += len(token_rows)
+            if not dry_run:
+                _snapshot_market_ticks(con, token_rows, tick_source="live_baseline")
+        console.print(f"Monitor loop {loop_index + 1}/{max(1, iterations)}: baseline_calls={baseline_calls}")
+
+        if dry_run:
+            console.print(
+                f"Dry run only: would sync-social max_handles={max_handles}, max_posts={max_posts_per_handle}, daily_x_cap={daily_x_cap}; "
+                f"would cloud-match cases={len(case_ids)} and trigger confidence>={min_confidence}, post_age<={max_trigger_age}."
+            )
+        else:
+            _sync_social_watchlist(con, backfill="24h", max_handles=max_handles, max_posts_per_handle=max_posts_per_handle, daily_cap=daily_x_cap)
+            for case_id in case_ids:
+                result = match_event_posts_with_cloud_model(con, case_id, load_semantic_matching_config())
+                if result.unavailable_reason:
+                    console.print(f"[yellow]{escape(result.unavailable_reason)}. Skipping cloud triggers for {case_id}.[/yellow]")
+                else:
+                    console.print(f"{case_id}: cloud matched {result.matches_written}; added {result.posts_added} event posts.")
+
+        candidates = live_burst_trigger_candidates(
+            con,
+            case_ids,
+            min_confidence,
+            limit=1,
+            min_match_created_at=None if dry_run else loop_started_at,
+            min_post_created_at=min_post_created_at,
+        )
+        if not candidates:
+            console.print("No new high-confidence burst trigger.")
+        elif dry_run:
+            candidate = candidates[0]
+            console.print(
+                f"Dry run trigger candidate: case={candidate['case_id']} post={candidate['post_id']} "
+                f"@{candidate['handle']} confidence={candidate['similarity']}"
+            )
+        else:
+            candidate = candidates[0]
+            _, token_rows = _market_tick_plan(con, "all", 1, case=candidate["case_id"])
+            phases = [("1s", 1, 60), ("10s", 10, 60), ("1m", 60, 110)]
+            written = _collect_burst_for_case(
+                con,
+                candidate["case_id"],
+                token_rows,
+                phases,
+                trigger_post_id=str(candidate["post_id"]),
+                trigger_handle=str(candidate.get("handle") or ""),
+                trigger_confidence=float(candidate.get("similarity") or 0),
+            )
+            console.print(f"Triggered burst for {candidate['case_id']}/{candidate['post_id']}: ticks={written}")
+            run_event_backtest_case(con, candidate["case_id"], list(DEFAULT_MICRO_HORIZONS), mode="micro")
+            path = write_event_backtest_report(con, candidate["case_id"], SIGNAL_REPORT_ROOT)
+            console.print(f"Updated event report: {path}")
+        if loop_index < max(1, iterations) - 1:
+            time.sleep(max(0, poll_seconds))
 
 
 @app.command("score")
@@ -878,7 +1116,104 @@ def _markets_for_case_tick_sync(con, case: str) -> list[dict]:
     return [dict(zip(columns, row))]
 
 
-def _snapshot_market_ticks(con, token_rows) -> int:
+def _collect_burst_for_case(
+    con,
+    case_id: str,
+    token_rows,
+    iterations,
+    trigger_post_id: Optional[str] = None,
+    trigger_handle: Optional[str] = None,
+    trigger_confidence: Optional[float] = None,
+) -> int:
+    if not token_rows:
+        console.print(f"[yellow]No token ids found for {case_id}. Run discover-event-case first.[/yellow]")
+        return 0
+    if trigger_post_id and live_burst_run_exists(con, case_id, trigger_post_id):
+        console.print(f"[yellow]Skipping {case_id}/{trigger_post_id}: burst already recorded.[/yellow]")
+        return 0
+    run_id = stable_hash([case_id, trigger_post_id or utc_now_iso()])[:24]
+    planned_calls = len(token_rows) * sum(count for _, _, count in iterations)
+    if trigger_post_id:
+        upsert_live_burst_run(
+            con,
+            {
+                "run_id": run_id,
+                "case_id": case_id,
+                "post_id": trigger_post_id,
+                "handle": trigger_handle,
+                "confidence": trigger_confidence,
+                "status": "running",
+                "planned_calls": planned_calls,
+                "ticks_written": 0,
+            },
+        )
+    total = 0
+    error = None
+    for label, interval, count in iterations:
+        for index in range(count):
+            try:
+                written = _snapshot_market_ticks(con, token_rows, tick_source="live_burst")
+            except Exception as exc:  # defensive: keep monitor alive if one snapshot fails
+                written = 0
+                error = str(exc)
+                console.print(f"[yellow]warning: burst failed for {case_id}: {exc}[/yellow]")
+            total += written
+            console.print(f"Burst {case_id} {label} {index + 1}/{count}: synced {written} midpoint tick(s).")
+            if index < count - 1:
+                time.sleep(interval)
+    if trigger_post_id:
+        upsert_live_burst_run(
+            con,
+            {
+                "run_id": run_id,
+                "case_id": case_id,
+                "post_id": trigger_post_id,
+                "handle": trigger_handle,
+                "confidence": trigger_confidence,
+                "status": "completed" if error is None and total >= planned_calls else "partial",
+                "planned_calls": planned_calls,
+                "ticks_written": total,
+                "error": error,
+            },
+        )
+    return total
+
+
+def _sync_social_watchlist(con, backfill: str, max_handles: int, max_posts_per_handle: int, daily_cap: int) -> int:
+    token = os.getenv("X_BEARER_TOKEN")
+    if not token:
+        console.print("[yellow]X_BEARER_TOKEN is not set. Skipping sync-social.[/yellow]")
+        return 0
+    handles = load_social_handles()[:max_handles]
+    planned_calls = len(handles) * 2
+    if not _check_x_budget(con, planned_calls, daily_cap, False, f"monitor sync-social handles={len(handles)} max_posts={max_posts_per_handle}"):
+        return 0
+    client = XApiClient(token)
+    seconds = parse_duration(backfill)
+    total = 0
+    for handle in handles:
+        try:
+            posts = client.backfill_user_posts(handle.handle, seconds, max_results=max_posts_per_handle)
+            record_api_call(con, "x", "users/by/username", notes=f"resolve @{handle.handle}")
+            record_api_call(con, "x", "users/:id/tweets", notes=f"timeline @{handle.handle}")
+        except RequestException as exc:
+            console.print(f"[yellow]warning: @{handle.handle} monitor backfill failed: {exc}[/yellow]")
+            continue
+        upsert_social_posts(con, posts)
+        if posts:
+            save_raw_payload("x_posts", handle.handle, [post.raw for post in posts])
+        total += len(posts)
+    console.print(f"Monitor synced {total} X post(s).")
+    return total
+
+
+def _case_ids_from_options(case: Optional[str], cases: Optional[str]) -> list[str]:
+    if cases:
+        return [part.strip() for part in cases.split(",") if part.strip()]
+    return [case] if case else []
+
+
+def _snapshot_market_ticks(con, token_rows, tick_source: str = "live") -> int:
     client = CLOBClient()
     observed_at = utc_now_iso()
     count = 0
@@ -888,7 +1223,19 @@ def _snapshot_market_ticks(con, token_rows) -> int:
         except RequestException as exc:
             console.print(f"[yellow]warning: midpoint failed for {market_slug}/{token_id}: {exc}[/yellow]")
             continue
-        insert_market_midpoint_tick(con, observed_at, market_slug, token_id, mid, liquidity, {"mid": mid, "token_id": token_id})
+        if tick_source == "live":
+            insert_market_midpoint_tick(con, observed_at, market_slug, token_id, mid, liquidity, {"mid": mid, "token_id": token_id})
+        else:
+            insert_market_midpoint_tick_with_source(
+                con,
+                observed_at,
+                market_slug,
+                token_id,
+                mid,
+                liquidity,
+                {"mid": mid, "token_id": token_id, "tick_source": tick_source},
+                tick_source=tick_source,
+            )
         count += 1
     return count
 
@@ -953,6 +1300,47 @@ def _render_account_metrics(metrics: list[dict]) -> None:
             str(row.get("recommended_status") or ""),
         )
     console.print(table)
+
+
+def _render_signal_discovery(result: dict) -> None:
+    market_table = Table(title="High-Interest Open Polymarket Pools")
+    market_table.add_column("Rank", justify="right")
+    market_table.add_column("Market")
+    market_table.add_column("Score", justify="right")
+    market_table.add_column("Liquidity", justify="right")
+    market_table.add_column("Volume", justify="right")
+    market_table.add_column("Terms")
+    for idx, item in enumerate((result.get("markets") or [])[:20], start=1):
+        record = item["record"]
+        market_table.add_row(
+            str(idx),
+            str(record.market_slug),
+            _fmt(item.get("score")),
+            _fmt(item.get("liquidity")),
+            _fmt(item.get("volume")),
+            ", ".join(item.get("query_terms") or []),
+        )
+    console.print(market_table)
+
+    source_table = Table(title="Discovered Signal Source Candidates")
+    source_table.add_column("Rank", justify="right")
+    source_table.add_column("Handle")
+    source_table.add_column("Market")
+    source_table.add_column("Score", justify="right")
+    source_table.add_column("Posts", justify="right")
+    source_table.add_column("Engagement", justify="right")
+    source_table.add_column("Status")
+    for idx, row in enumerate((result.get("source_candidates") or [])[:30], start=1):
+        source_table.add_row(
+            str(idx),
+            f"@{row.get('handle')}",
+            str(row.get("market_slug") or ""),
+            _fmt(row.get("discovery_score")),
+            str(row.get("post_count") or 0),
+            _fmt(row.get("engagement_score")),
+            str(row.get("recommended_status") or ""),
+        )
+    console.print(source_table)
 
 
 def _since_iso(duration: str) -> str:

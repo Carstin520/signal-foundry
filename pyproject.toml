@@ -22,6 +22,9 @@ dependencies = [
 dev = [
   "pytest>=7.0",
 ]
+semantic = [
+  "sentence-transformers>=2.7",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -14,6 +14,7 @@ from .config import SIGNAL_REPORT_ROOT, Web3AccountConfig, parse_duration
 from .models import MarketRecord
 from .storage import (
     insert_historical_price_ticks,
+    live_burst_runs_for_case,
     upsert_event_account_metrics,
     upsert_event_cases,
     upsert_event_case_posts,
@@ -142,6 +143,12 @@ TRUMP_CHINA_CATALYST_WATCH = (
     "谈判",
 )
 DEFAULT_HORIZONS = ("1h", "6h", "24h", "72h")
+DEFAULT_MICRO_HORIZONS = ("1s", "10s", "30s", "1m", "5m", "10m", "30m", "2h")
+MICRO_CORE_HORIZONS = {"1m", "5m", "10m"}
+PAPER_TRADE_MIN_ROUND_TRIP_COST = 0.01
+PAPER_TRADE_SLIPPAGE_BUFFER = 0.002
+PAPER_TRADE_MIN_EDGE = 0.03
+PAPER_TRADE_STRONG_EDGE = 0.08
 
 
 def slugify_case_id(query: str) -> str:
@@ -197,6 +204,7 @@ def normalize_price_history(
     payload: Mapping[str, object],
     token_to_market: Mapping[str, Mapping[str, object]],
     ingested_at: Optional[str] = None,
+    tick_source: str = "historical",
 ) -> List[dict]:
     history = payload.get("history") if isinstance(payload, Mapping) else {}
     if not isinstance(history, Mapping):
@@ -221,7 +229,7 @@ def normalize_price_history(
                     "token_id": str(token_id),
                     "mid": price,
                     "liquidity": market.get("liquidity"),
-                    "tick_source": "historical",
+                    "tick_source": tick_source,
                     "ingested_at": ingested_at,
                     "raw": dict(point),
                 }
@@ -262,7 +270,10 @@ def run_event_backtest(
         return [], []
     posts = _case_posts(con, case_id)
     ticks = _case_ticks(con, str(case["market_slug"]))
-    study_posts = _dedupe_volatility_posts(posts) if mode == "volatility" else _dedupe_directional_posts(posts)
+    if mode in {"volatility", "micro"}:
+        study_posts = _dedupe_volatility_posts(posts)
+    else:
+        study_posts = _dedupe_directional_posts(posts)
     impacts = _post_impacts(case_id, str(case["market_slug"]), study_posts, ticks, horizons, mode=mode)
     metrics = _account_metrics(case_id, study_posts, impacts, mode=mode)
     upsert_event_post_impacts(con, impacts)
@@ -277,7 +288,10 @@ def write_event_backtest_report(con: duckdb.DuckDBPyConnection, case_id: str, re
     metrics = _event_metrics(con, case_id)
     impacts = _event_impacts(con, case_id)
     posts = _case_posts(con, case_id)
-    ramp_rows = [row for row in impacts if row.get("mode") == "ramp" or row.get("tradable_ramp") is not None]
+    live_runs = _live_burst_runs(con, case_id)
+    ramp_rows = [row for row in impacts if row.get("mode") in {"ramp", "micro"} or row.get("tradable_ramp") is not None]
+    micro_rows = [row for row in impacts if row.get("mode") == "micro"]
+    has_minute_floor = any("minute_floor" in (row.get("risk_tags") or []) for row in impacts)
     lines = [
         f"# Event Backtest: {case_id}",
         "",
@@ -287,38 +301,92 @@ def write_event_backtest_report(con: duckdb.DuckDBPyConnection, case_id: str, re
         f"- Posts: {len(posts)}",
         f"- Impacts: {len(impacts)}",
         f"- Modes: {', '.join(sorted({str(row.get('mode') or 'unknown') for row in impacts})) if impacts else 'n/a'}",
+        f"- Price resolution warning: {'minute_floor; sub-minute historical horizons are not validated' if has_minute_floor else 'n/a'}",
         "",
         "## Account Ranking",
         "",
-        "| Account | Lead | Tradable | Ramp Hit | Strong Ramp | Avg Fav | Avg Adverse | Already Hot | Samples | Status |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| Account | Lead | Tradable | Micro Hit | Sub-10m | Median TTP | Ramp Hit | Strong | Avg Fav | Already Hot | Samples | Status |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     if not metrics:
-        lines.append("| n/a | 0 | 0 | n/a | n/a | n/a | n/a | n/a | 0 | no_samples |")
+        lines.append("| n/a | 0 | 0 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | 0 | no_samples |")
     for row in metrics:
         lines.append(
             f"| @{row['account']} | {_fmt(row['lead_score'])} | {_fmt(row.get('tradable_score'))} | "
+            f"{_fmt(row.get('micro_hit_rate'))} | {_fmt(row.get('sub_10m_hit_rate'))} | "
+            f"{_fmt(row.get('median_time_to_price_in'))} | "
             f"{_fmt(row.get('ramp_hit_rate') if row.get('ramp_hit_rate') is not None else row.get('hit_rate'))} | "
             f"{_fmt(row.get('strong_ramp_rate'))} | {_fmt(row.get('avg_max_favorable_delta'))} | "
-            f"{_fmt(row.get('avg_max_adverse_delta'))} | {_fmt(row.get('already_hot_rate'))} | "
+            f"{_fmt(row.get('already_hot_rate'))} | "
             f"{row['sample_size']} | {row['recommended_status']} |"
         )
+    if micro_rows:
+        lines.extend(
+            [
+                "",
+                "## Micro Ladder",
+                "",
+                "| Account | Horizon | Entry Delay | Entry | Future | Move | Net Move | Cost | Time To 3pp | Max 10m | Net Max Fav | Reversal 30m | Resolution | Tags |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+            ]
+        )
+        for row in micro_rows[:120]:
+            lines.append(
+                f"| @{row['handle']} | {row['horizon']} | {_fmt(row.get('entry_delay_seconds'))} | "
+                f"{_fmt(row.get('entry_mid'))} | {_fmt(row.get('future_mid'))} | "
+                f"{_fmt(row.get('close_delta') if row.get('close_delta') is not None else row.get('delta'))} | "
+                f"{_fmt(row.get('net_close_delta'))} | {_fmt(row.get('execution_cost'))} | "
+                f"{_fmt(row.get('time_to_3pp_seconds'))} | {_fmt(row.get('max_move_10m'))} | "
+                f"{_fmt(row.get('net_max_favorable_delta'))} | {_fmt(row.get('reversal_30m'))} | "
+                f"{row.get('price_data_resolution') or 'n/a'} | "
+                f"{', '.join(row.get('risk_tags') or [])} |"
+            )
+    if live_runs:
+        lines.extend(
+            [
+                "",
+                "## Live Micro Evidence",
+                "",
+                "| Trigger | Account | Confidence | Status | Ticks | 1s | 10s | 30s | 1m | 5m | 10m | Net 10m | Cost | Time To 3pp | Max 10m | Reversal 30m |",
+                "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        by_post = defaultdict(list)
+        for row in micro_rows:
+            by_post[str(row.get("post_id"))].append(row)
+        for run in live_runs[:30]:
+            post_rows = by_post.get(str(run.get("post_id")), [])
+            by_horizon = {str(row.get("horizon")): row for row in post_rows}
+            best = _best_live_micro_row(post_rows)
+            lines.append(
+                f"| {run.get('post_id')} | @{run.get('handle') or 'n/a'} | {_fmt(run.get('confidence'))} | "
+                f"{run.get('status')} | {run.get('ticks_written')} | "
+                f"{_fmt(_row_move(by_horizon.get('1s')))} | {_fmt(_row_move(by_horizon.get('10s')))} | "
+                f"{_fmt(_row_move(by_horizon.get('30s')))} | {_fmt(_row_move(by_horizon.get('1m')))} | "
+                f"{_fmt(_row_move(by_horizon.get('5m')))} | {_fmt(_row_move(by_horizon.get('10m')))} | "
+                f"{_fmt(_row_net_move(by_horizon.get('10m')))} | {_fmt(best.get('execution_cost') if best else None)} | "
+                f"{_fmt(best.get('time_to_3pp_seconds') if best else None)} | "
+                f"{_fmt(best.get('max_move_10m') if best else None)} | "
+                f"{_fmt(best.get('reversal_30m') if best else None)} |"
+            )
     lines.extend(
         [
             "",
             "## Ramp Opportunity",
             "",
-            "| Account | Horizon | Entry | Entry Delay | Max Fav | Max Adv | Close | Price-In Time | Ramp Mins | Tags | Tradable |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- | --- |",
+            "| Account | Horizon | Entry | Entry Delay | Max Fav | Net Fav | Max Adv | Close | Net Close | Cost | Price-In Time | Ramp Mins | Tags | Tradable |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- | --- |",
         ]
     )
     if not ramp_rows:
-        lines.append("| n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | no_matched_posts | False |")
+        lines.append("| n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | no_matched_posts | False |")
     for row in ramp_rows[:80]:
         lines.append(
             f"| @{row['handle']} | {row['horizon']} | {_fmt(row['entry_mid'])} | "
             f"{_fmt(row.get('entry_delay_seconds'))} | {_fmt(row['max_favorable_delta'])} | "
-            f"{_fmt(row['max_adverse_delta'])} | {_fmt(row.get('close_delta') if row.get('close_delta') is not None else row.get('delta'))} | "
+            f"{_fmt(row.get('net_max_favorable_delta'))} | {_fmt(row['max_adverse_delta'])} | "
+            f"{_fmt(row.get('close_delta') if row.get('close_delta') is not None else row.get('delta'))} | "
+            f"{_fmt(row.get('net_close_delta'))} | {_fmt(row.get('execution_cost'))} | "
             f"{row.get('price_in_time') or 'n/a'} | {_fmt(row.get('ramp_duration_minutes'))} | "
             f"{', '.join(row.get('risk_tags') or [])} | {row.get('tradable_ramp')} |"
         )
@@ -340,15 +408,17 @@ def write_event_backtest_report(con: duckdb.DuckDBPyConnection, case_id: str, re
             "",
             "## Price Impact Samples",
             "",
-            "| Account | Horizon | Entry | Future | Delta | Favorable | Adverse | Late To Price | Positive |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+            "| Account | Horizon | Entry | Future | Delta | Net Delta | Favorable | Net Favorable | Adverse | Late To Price | Positive | Paper Positive |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
         ]
     )
     for row in impacts[:80]:
         lines.append(
             f"| @{row['handle']} | {row['horizon']} | {_fmt(row['entry_mid'])} | {_fmt(row['future_mid'])} | "
-            f"{_fmt(row['delta'])} | {_fmt(row['max_favorable_delta'])} | {_fmt(row['max_adverse_delta'])} | "
-            f"{row['price_move_started_before_post']} | {row['is_positive']} |"
+            f"{_fmt(row['delta'])} | {_fmt(row.get('net_close_delta'))} | "
+            f"{_fmt(row['max_favorable_delta'])} | {_fmt(row.get('net_max_favorable_delta'))} | "
+            f"{_fmt(row['max_adverse_delta'])} | {row['price_move_started_before_post']} | "
+            f"{row['is_positive']} | {row.get('paper_trade_positive')} |"
         )
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
@@ -450,6 +520,24 @@ def event_case_token_rows(con: duckdb.DuckDBPyConnection, case_id: str) -> list[
     return result
 
 
+def event_price_windows(
+    con: duckdb.DuckDBPyConnection,
+    case_id: str,
+    pre: str = "10m",
+    post: str = "2h",
+    max_windows: int = 200,
+) -> list[tuple[datetime, datetime]]:
+    pre_seconds = parse_duration(pre)
+    post_seconds = parse_duration(post)
+    windows = []
+    for row in _case_posts(con, case_id):
+        created_at = to_datetime(row.get("created_at"))
+        if created_at is None:
+            continue
+        windows.append((created_at - timedelta(seconds=pre_seconds), created_at + timedelta(seconds=post_seconds)))
+    return _merge_time_windows(windows)[:max_windows]
+
+
 def _candidate_markets(query: str, keywords: Sequence[str], max_pages: int) -> List[MarketRecord]:
     client = GammaMarketClient()
     candidates = []
@@ -490,11 +578,158 @@ def _post_impacts(
     horizons: Sequence[str],
     mode: str = "ramp",
 ) -> list[dict]:
+    if mode == "micro":
+        return _micro_post_impacts(case_id, market_slug, posts, ticks, horizons)
     if mode == "ramp":
         return _ramp_post_impacts(case_id, market_slug, posts, ticks, horizons)
     if mode == "volatility":
         return _volatility_post_impacts(case_id, market_slug, posts, ticks, horizons)
     return _event_post_impacts(case_id, market_slug, posts, ticks, horizons)
+
+
+def _micro_post_impacts(case_id: str, market_slug: str, posts: Sequence[dict], ticks: Sequence[dict], horizons: Sequence[str]) -> list[dict]:
+    impacts = []
+    for post in posts:
+        post_ts = to_datetime(post["created_at"])
+        if post_ts is None:
+            continue
+        entry = _nearest_tick(ticks, post_ts, before=False)
+        if entry is None:
+            continue
+        entry_ts = to_datetime(entry["observed_at"])
+        if entry_ts is None:
+            continue
+        entry_mid = float(entry["mid"])
+        sign = 1 if post.get("direction") == "bullish" else -1 if post.get("direction") == "bearish" else 0
+        entry_delay = max(0.0, (entry_ts - post_ts).total_seconds())
+        pre_abs_move = _pre_abs_move_before_post(ticks, post_ts)
+        late_after_price_move = pre_abs_move >= 0.03
+        resolution_label, resolution_seconds = _tick_resolution(ticks, post_ts - timedelta(minutes=10), post_ts + timedelta(hours=2))
+        crowded = entry_mid >= 0.90 or entry_mid <= 0.10
+        for horizon in horizons:
+            horizon_seconds = parse_duration(horizon)
+            end_ts = post_ts + timedelta(seconds=horizon_seconds)
+            risk_tags = ["micro_price_in"]
+            if sign == 0:
+                risk_tags.append("direction_unknown")
+            if late_after_price_move:
+                risk_tags.append("late_after_price_move")
+            if crowded:
+                risk_tags.append("crowded_entry")
+            if resolution_label == "minute_floor":
+                risk_tags.append("minute_floor")
+            if resolution_seconds is not None and horizon_seconds < resolution_seconds:
+                risk_tags.append("insufficient_resolution")
+            if entry_delay > min(60.0, horizon_seconds):
+                risk_tags.append("slow_entry_tick")
+
+            window = [tick for tick in ticks if _between_tick(tick, entry_ts, end_ts)]
+            ten_min_window = [tick for tick in ticks if _between_tick(tick, entry_ts, post_ts + timedelta(minutes=10))]
+            thirty_min_window = [tick for tick in ticks if _between_tick(tick, entry_ts, post_ts + timedelta(minutes=30))]
+            if not window:
+                impacts.append(
+                    _micro_impact_row(
+                        case_id,
+                        market_slug,
+                        post,
+                        horizon,
+                        entry_mid,
+                        None,
+                        None,
+                        None,
+                        None,
+                        entry_delay,
+                        None,
+                        None,
+                        None,
+                        late_after_price_move,
+                        False,
+                        False,
+                        crowded,
+                        resolution_label,
+                        risk_tags + ["no_window_ticks"],
+                        execution_cost=None,
+                        net_close_delta=None,
+                        net_max_favorable=None,
+                        net_max_adverse=None,
+                        paper_trade_positive=False,
+                        paper_trade_strong=False,
+                    )
+                )
+                continue
+            future_mid = float(window[-1]["mid"])
+            move_points = [
+                (tick, _signed_or_abs_move(float(tick["mid"]) - entry_mid, sign))
+                for tick in window
+                if tick.get("mid") is not None
+            ]
+            raw_moves_10m = [_signed_or_abs_move(float(tick["mid"]) - entry_mid, sign) for tick in ten_min_window if tick.get("mid") is not None]
+            raw_moves_30m = [_signed_or_abs_move(float(tick["mid"]) - entry_mid, sign) for tick in thirty_min_window if tick.get("mid") is not None]
+            if not move_points:
+                continue
+            moves = [move for _, move in move_points]
+            net_move_points = [(tick, move - _round_trip_execution_cost(entry, tick)) for tick, move in move_points]
+            net_moves = [move for _, move in net_move_points]
+            max_favorable = max(moves)
+            max_adverse = min(moves)
+            net_max_favorable = max(net_moves)
+            net_max_adverse = min(net_moves)
+            max_10m = max(raw_moves_10m) if raw_moves_10m else None
+            close_30m = raw_moves_30m[-1] if raw_moves_30m else None
+            reversal_30m = (max_10m - close_30m) if max_10m is not None and close_30m is not None else None
+            close_delta = _signed_or_abs_move(future_mid - entry_mid, sign)
+            execution_cost = _round_trip_execution_cost(entry, window[-1])
+            net_close_delta = close_delta - execution_cost
+            price_tick = _first_threshold_tick(window, entry_mid, sign, threshold=0.03)
+            time_to_3pp = None
+            price_in_time = None
+            if price_tick:
+                price_in_ts = to_datetime(price_tick["observed_at"])
+                if price_in_ts is not None:
+                    time_to_3pp = max(0.0, (price_in_ts - entry_ts).total_seconds())
+                    price_in_time = price_in_ts.isoformat()
+            insufficient = "insufficient_resolution" in risk_tags
+            micro_hit = (not insufficient) and (max_favorable >= 0.03)
+            strong_micro = (not insufficient) and (max_favorable >= 0.08 and max_adverse > -0.05)
+            paper_trade_positive = (not insufficient) and (net_max_favorable >= PAPER_TRADE_MIN_EDGE)
+            paper_trade_strong = (not insufficient) and (net_max_favorable >= PAPER_TRADE_STRONG_EDGE and net_max_adverse > -0.05)
+            if micro_hit and not paper_trade_positive:
+                risk_tags.append("cost_erased_move")
+            if execution_cost >= 0.02:
+                risk_tags.append("high_execution_cost")
+            tradable = micro_hit and paper_trade_positive and entry_delay <= 60 and not late_after_price_move
+            impacts.append(
+                _micro_impact_row(
+                    case_id,
+                    market_slug,
+                    post,
+                    horizon,
+                    entry_mid,
+                    future_mid,
+                    close_delta,
+                    max_favorable,
+                    max_adverse,
+                    entry_delay,
+                    price_in_time,
+                    time_to_3pp,
+                    max_10m,
+                    late_after_price_move,
+                    micro_hit,
+                    strong_micro,
+                    crowded,
+                    resolution_label,
+                    risk_tags,
+                    tradable=tradable,
+                    reversal_30m=reversal_30m,
+                    execution_cost=execution_cost,
+                    net_close_delta=net_close_delta,
+                    net_max_favorable=net_max_favorable,
+                    net_max_adverse=net_max_adverse,
+                    paper_trade_positive=paper_trade_positive,
+                    paper_trade_strong=paper_trade_strong,
+                )
+            )
+    return impacts
 
 
 def _event_post_impacts(case_id: str, market_slug: str, posts: Sequence[dict], ticks: Sequence[dict], horizons: Sequence[str]) -> list[dict]:
@@ -717,11 +952,92 @@ def _volatility_post_impacts(case_id: str, market_slug: str, posts: Sequence[dic
 
 
 def _account_metrics(case_id: str, posts: Sequence[dict], impacts: Sequence[dict], mode: str = "ramp") -> list[dict]:
+    if mode == "micro":
+        return _micro_account_metrics(case_id, posts, impacts)
     if mode == "volatility":
         return _volatility_account_metrics(case_id, posts, impacts)
     if mode == "ramp":
         return _ramp_account_metrics(case_id, posts, impacts)
     return _event_account_metrics(case_id, posts, impacts)
+
+
+def _micro_account_metrics(case_id: str, posts: Sequence[dict], impacts: Sequence[dict]) -> list[dict]:
+    by_account = defaultdict(list)
+    preferred = _preferred_micro_impacts(impacts)
+    for impact in preferred:
+        by_account[impact["handle"]].append(impact)
+    first_posts = sorted(posts, key=lambda item: item["created_at"])
+    lead_rank = {post["handle"]: idx for idx, post in enumerate(first_posts)}
+    rows = []
+    for account, samples in by_account.items():
+        usable = [row for row in samples if "insufficient_resolution" not in (row.get("risk_tags") or [])]
+        hits = sum(1 for row in usable if row.get("is_positive"))
+        paper_hits = sum(1 for row in usable if row.get("paper_trade_positive"))
+        strong = sum(1 for row in usable if row.get("is_strong") or row.get("strong_ramp"))
+        tradable = sum(1 for row in usable if row.get("tradable_ramp"))
+        late = sum(1 for row in usable if row.get("already_hot_penalty") or row.get("price_move_started_before_post"))
+        sub_10m = sum(
+            1
+            for row in usable
+            if row.get("time_to_3pp_seconds") is not None and float(row["time_to_3pp_seconds"]) <= 10 * 60
+        )
+        hit_rate = hits / len(usable) if usable else 0
+        paper_hit_rate = paper_hits / len(usable) if usable else 0
+        strong_rate = strong / len(usable) if usable else 0
+        late_rate = late / len(usable) if usable else 0
+        sub_10m_rate = sub_10m / len(usable) if usable else 0
+        false_fomo = 1 - paper_hit_rate if usable else None
+        lead_score = max(0, 25 - lead_rank.get(account, 5) * 5)
+        avg_fav = _avg(row.get("max_favorable_delta") for row in usable) or 0
+        avg_adv = _avg(row.get("max_adverse_delta") for row in usable) or 0
+        median_ttp = _median(row.get("time_to_3pp_seconds") for row in usable)
+        tradable_score = max(
+            0.0,
+            min(
+                100.0,
+                paper_hit_rate * 35
+                + sub_10m_rate * 25
+                + strong_rate * 15
+                + min(15.0, avg_fav * 250)
+                + lead_score * 0.25
+                - late_rate * 20
+                - max(0.0, -avg_adv) * 80,
+            ),
+        )
+        if tradable > 0 and paper_hits > 0 and sub_10m > 0:
+            status = "micro_source"
+        elif paper_hits > 0:
+            status = "watch"
+        elif hits > 0:
+            status = "cost_erased_watch"
+        elif samples and not usable:
+            status = "insufficient_resolution"
+        else:
+            status = "noise_or_no_micro_ramp"
+        rows.append(
+            {
+                "account": account,
+                "case_id": case_id,
+                "lead_score": lead_score,
+                "impact_score": tradable_score,
+                "hit_rate": hit_rate,
+                "false_fomo_rate": false_fomo,
+                "sample_size": len(samples),
+                "ramp_hit_rate": hit_rate,
+                "strong_ramp_rate": strong_rate,
+                "avg_entry_delay_seconds": _avg(row.get("entry_delay_seconds") for row in usable),
+                "avg_max_favorable_delta": avg_fav,
+                "avg_max_adverse_delta": avg_adv,
+                "already_hot_rate": late_rate if usable else None,
+                "tradable_score": tradable_score,
+                "micro_hit_rate": hit_rate,
+                "median_time_to_price_in": median_ttp,
+                "sub_10m_hit_rate": sub_10m_rate,
+                "late_after_price_move_rate": late_rate if usable else None,
+                "recommended_status": status,
+            }
+        )
+    return sorted(rows, key=lambda item: (item["tradable_score"], item["lead_score"]), reverse=True)
 
 
 def _event_account_metrics(case_id: str, posts: Sequence[dict], impacts: Sequence[dict]) -> list[dict]:
@@ -891,6 +1207,14 @@ def _preferred_horizon_impacts(impacts: Sequence[dict]) -> list[dict]:
     return list(impacts)
 
 
+def _preferred_micro_impacts(impacts: Sequence[dict]) -> list[dict]:
+    for horizon in ("5m", "10m", "1m"):
+        rows = [impact for impact in impacts if impact.get("horizon") == horizon]
+        if rows:
+            return rows
+    return list(impacts)
+
+
 def _dedupe_directional_posts(posts: Sequence[dict], bucket_minutes: int = 60) -> list[dict]:
     seen = set()
     result = []
@@ -948,7 +1272,7 @@ def _case_ticks(con: duckdb.DuckDBPyConnection, market_slug: str) -> list[dict]:
     yes_token = _yes_token_id(con, market_slug)
     rows = con.execute(
         """
-        select observed_at, market_slug, token_id, mid
+        select observed_at, market_slug, token_id, mid, spread, liquidity, best_bid, best_ask, tick_source
         from market_ticks
         where market_slug = ? and mid is not null
           and (? is null or token_id = ?)
@@ -974,7 +1298,8 @@ def _event_metrics(con: duckdb.DuckDBPyConnection, case_id: str) -> list[dict]:
         select account, lead_score, impact_score, hit_rate, false_fomo_rate, sample_size,
                ramp_hit_rate, strong_ramp_rate, avg_entry_delay_seconds,
                avg_max_favorable_delta, avg_max_adverse_delta, already_hot_rate,
-               tradable_score, recommended_status
+               tradable_score, micro_hit_rate, median_time_to_price_in,
+               sub_10m_hit_rate, late_after_price_move_rate, recommended_status
         from event_account_metrics
         where case_id = ?
         order by coalesce(tradable_score, impact_score) desc, lead_score desc
@@ -992,7 +1317,11 @@ def _event_impacts(con: duckdb.DuckDBPyConnection, case_id: str) -> list[dict]:
                max_favorable_delta, max_adverse_delta, entry_delay_seconds, price_in_time,
                ramp_duration_minutes, price_move_started_before_post, is_positive,
                is_strong, tradable_ramp, strong_ramp, already_hot_penalty,
-               crowded_entry, late_stage_ramp, risk_tags
+               crowded_entry, late_stage_ramp, price_data_resolution,
+               time_to_3pp_seconds, max_move_10m, reversal_30m,
+               execution_cost, net_close_delta, net_max_favorable_delta,
+               net_max_adverse_delta, paper_trade_positive, paper_trade_strong,
+               risk_tags
         from event_post_impacts
         where case_id = ?
         order by handle, horizon
@@ -1006,6 +1335,35 @@ def _event_impacts(con: duckdb.DuckDBPyConnection, case_id: str) -> list[dict]:
         item["risk_tags"] = _loads(item.get("risk_tags"), [])
         result.append(item)
     return result
+
+
+def _live_burst_runs(con: duckdb.DuckDBPyConnection, case_id: str) -> list[dict]:
+    try:
+        return live_burst_runs_for_case(con, case_id)
+    except duckdb.CatalogException:
+        return []
+
+
+def _best_live_micro_row(rows: Sequence[dict]) -> Optional[dict]:
+    if not rows:
+        return None
+    for horizon in ("10m", "5m", "1m", "30m", "2h"):
+        for row in rows:
+            if row.get("horizon") == horizon:
+                return row
+    return rows[0]
+
+
+def _row_move(row: Optional[dict]) -> Optional[float]:
+    if not row:
+        return None
+    return row.get("close_delta") if row.get("close_delta") is not None else row.get("delta")
+
+
+def _row_net_move(row: Optional[dict]) -> Optional[float]:
+    if not row:
+        return None
+    return row.get("net_close_delta") if row.get("net_close_delta") is not None else _row_move(row)
 
 
 def _nearest_tick(ticks: Sequence[dict], target: datetime, before: bool) -> Optional[dict]:
@@ -1044,6 +1402,152 @@ def _pre_abs_move_before_post(ticks: Sequence[dict], post_ts: datetime) -> float
 def _between_tick(tick: Mapping[str, object], start: datetime, end: datetime) -> bool:
     ts = to_datetime(tick.get("observed_at"))
     return ts is not None and start <= ts <= end
+
+
+def _micro_impact_row(
+    case_id: str,
+    market_slug: str,
+    post: Mapping[str, object],
+    horizon: str,
+    entry_mid: Optional[float],
+    future_mid: Optional[float],
+    close_delta: Optional[float],
+    max_favorable: Optional[float],
+    max_adverse: Optional[float],
+    entry_delay: Optional[float],
+    price_in_time: Optional[str],
+    time_to_3pp: Optional[float],
+    max_10m: Optional[float],
+    late_after_price_move: bool,
+    micro_hit: bool,
+    strong_micro: bool,
+    crowded: bool,
+    resolution_label: str,
+    risk_tags: Sequence[str],
+    tradable: bool = False,
+    reversal_30m: Optional[float] = None,
+    execution_cost: Optional[float] = None,
+    net_close_delta: Optional[float] = None,
+    net_max_favorable: Optional[float] = None,
+    net_max_adverse: Optional[float] = None,
+    paper_trade_positive: bool = False,
+    paper_trade_strong: bool = False,
+) -> dict:
+    return {
+        "mode": "micro",
+        "case_id": case_id,
+        "post_id": post["post_id"],
+        "handle": post["handle"],
+        "market_slug": market_slug,
+        "horizon": horizon,
+        "entry_mid": entry_mid,
+        "future_mid": future_mid,
+        "delta": close_delta,
+        "close_delta": close_delta,
+        "max_favorable_delta": max_favorable,
+        "max_adverse_delta": max_adverse,
+        "entry_delay_seconds": entry_delay,
+        "price_in_time": price_in_time,
+        "ramp_duration_minutes": (time_to_3pp / 60) if time_to_3pp is not None else None,
+        "price_move_started_before_post": late_after_price_move,
+        "is_positive": micro_hit,
+        "is_strong": strong_micro,
+        "tradable_ramp": tradable,
+        "strong_ramp": strong_micro,
+        "already_hot_penalty": late_after_price_move,
+        "crowded_entry": crowded,
+        "late_stage_ramp": crowded and micro_hit,
+        "price_data_resolution": resolution_label,
+        "time_to_3pp_seconds": time_to_3pp,
+        "max_move_10m": max_10m,
+        "reversal_30m": reversal_30m,
+        "execution_cost": execution_cost,
+        "net_close_delta": net_close_delta,
+        "net_max_favorable_delta": net_max_favorable,
+        "net_max_adverse_delta": net_max_adverse,
+        "paper_trade_positive": paper_trade_positive,
+        "paper_trade_strong": paper_trade_strong,
+        "risk_tags": list(dict.fromkeys(risk_tags)),
+    }
+
+
+def _tick_resolution(ticks: Sequence[dict], start: datetime, end: datetime) -> tuple[str, Optional[float]]:
+    stamps = [to_datetime(tick.get("observed_at")) for tick in ticks if _between_tick(tick, start, end)]
+    stamps = [stamp for stamp in stamps if stamp is not None]
+    if len(stamps) < 2:
+        return "sparse", None
+    gaps = sorted((stamps[index] - stamps[index - 1]).total_seconds() for index in range(1, len(stamps)))
+    median_gap = gaps[len(gaps) // 2]
+    sources = {str(tick.get("tick_source") or "") for tick in ticks if _between_tick(tick, start, end)}
+    if median_gap <= 1.5:
+        return "1s", median_gap
+    if median_gap <= 10:
+        return "10s", median_gap
+    if median_gap <= 30:
+        return "30s", median_gap
+    if median_gap <= 75:
+        return ("minute_floor" if any(source.startswith("historical") for source in sources) else "1m", median_gap)
+    return "sparse", median_gap
+
+
+def _signed_or_abs_move(raw_move: float, sign: int) -> float:
+    return abs(raw_move) if sign == 0 else raw_move * sign
+
+
+def _round_trip_execution_cost(entry_tick: Mapping[str, object], exit_tick: Optional[Mapping[str, object]]) -> float:
+    entry_half = _half_spread(entry_tick)
+    exit_half = _half_spread(exit_tick) if exit_tick is not None else None
+    if entry_half is None and exit_half is None:
+        return PAPER_TRADE_MIN_ROUND_TRIP_COST
+    known_cost = sum(value for value in (entry_half, exit_half) if value is not None)
+    missing_halves = int(entry_half is None) + int(exit_half is None)
+    fallback_cost = missing_halves * (PAPER_TRADE_MIN_ROUND_TRIP_COST / 2)
+    return max(PAPER_TRADE_MIN_ROUND_TRIP_COST, known_cost + fallback_cost + PAPER_TRADE_SLIPPAGE_BUFFER)
+
+
+def _half_spread(tick: Optional[Mapping[str, object]]) -> Optional[float]:
+    if not tick:
+        return None
+    spread = _float_value(tick.get("spread"))
+    if spread is not None and spread > 0:
+        return spread / 2
+    bid = _float_value(tick.get("best_bid"))
+    ask = _float_value(tick.get("best_ask"))
+    if bid is not None and ask is not None and ask >= bid:
+        return (ask - bid) / 2
+    return None
+
+
+def _float_value(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_threshold_tick(ticks: Sequence[dict], entry_mid: float, sign: int, threshold: float) -> Optional[dict]:
+    for tick in ticks:
+        if tick.get("mid") is None:
+            continue
+        if _signed_or_abs_move(float(tick["mid"]) - entry_mid, sign) >= threshold:
+            return tick
+    return None
+
+
+def _merge_time_windows(windows: Sequence[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
+    ordered = sorted((start, end) for start, end in windows if start <= end)
+    if not ordered:
+        return []
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _point_timestamp(point: Mapping[str, object]) -> Optional[int]:
@@ -1144,6 +1648,24 @@ def _avg(values: Iterable[object]) -> Optional[float]:
     if not floats:
         return None
     return sum(floats) / len(floats)
+
+
+def _median(values: Iterable[object]) -> Optional[float]:
+    floats = []
+    for value in values:
+        if value is None:
+            continue
+        try:
+            floats.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    if not floats:
+        return None
+    floats.sort()
+    midpoint = len(floats) // 2
+    if len(floats) % 2:
+        return floats[midpoint]
+    return (floats[midpoint - 1] + floats[midpoint]) / 2
 
 
 def _fmt(value: object) -> str:

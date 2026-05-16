@@ -1,5 +1,5 @@
 x:
-  daily_call_cap: 80
+  daily_call_cap: 200
   sync_social:
     max_handles: 10
     max_posts_per_handle: 20

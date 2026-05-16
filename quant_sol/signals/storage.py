@@ -185,6 +185,24 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     )
     con.execute(
         """
+        create table if not exists signal_discovery_sources (
+            run_id varchar not null,
+            platform varchar not null,
+            handle varchar not null,
+            market_slug varchar not null,
+            first_seen_at timestamp,
+            post_count integer,
+            engagement_score double,
+            discovery_score double,
+            recommended_status varchar,
+            evidence json,
+            created_at timestamp not null,
+            primary key (run_id, platform, handle, market_slug)
+        )
+        """
+    )
+    con.execute(
+        """
         create table if not exists account_market_mentions (
             account varchar not null,
             post_id varchar not null,
@@ -344,6 +362,41 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     )
     con.execute(
         """
+        create table if not exists post_market_semantic_matches (
+            case_id varchar not null,
+            post_id varchar not null,
+            handle varchar not null,
+            market_slug varchar not null,
+            method varchar not null,
+            similarity double,
+            matched_concepts json,
+            rejected_concepts json,
+            decision varchar,
+            created_at timestamp not null,
+            primary key (case_id, post_id, market_slug, method)
+        )
+        """
+    )
+    con.execute(
+        """
+        create table if not exists live_burst_runs (
+            run_id varchar primary key,
+            case_id varchar not null,
+            post_id varchar not null,
+            handle varchar,
+            triggered_at timestamp not null,
+            confidence double,
+            status varchar not null,
+            planned_calls integer,
+            ticks_written integer,
+            error varchar,
+            updated_at timestamp not null,
+            unique (case_id, post_id)
+        )
+        """
+    )
+    con.execute(
+        """
         create table if not exists event_post_impacts (
             case_id varchar not null,
             post_id varchar not null,
@@ -368,6 +421,16 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             already_hot_penalty boolean,
             crowded_entry boolean,
             late_stage_ramp boolean,
+            price_data_resolution varchar,
+            time_to_3pp_seconds double,
+            max_move_10m double,
+            reversal_30m double,
+            execution_cost double,
+            net_close_delta double,
+            net_max_favorable_delta double,
+            net_max_adverse_delta double,
+            paper_trade_positive boolean,
+            paper_trade_strong boolean,
             risk_tags json,
             evaluated_at timestamp not null,
             primary key (case_id, post_id, market_slug, horizon)
@@ -391,6 +454,10 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             avg_max_adverse_delta double,
             already_hot_rate double,
             tradable_score double,
+            micro_hit_rate double,
+            median_time_to_price_in double,
+            sub_10m_hit_rate double,
+            late_after_price_move_rate double,
             recommended_status varchar,
             evaluated_at timestamp not null,
             primary key (account, case_id)
@@ -443,6 +510,16 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             "already_hot_penalty": "boolean",
             "crowded_entry": "boolean",
             "late_stage_ramp": "boolean",
+            "price_data_resolution": "varchar",
+            "time_to_3pp_seconds": "double",
+            "max_move_10m": "double",
+            "reversal_30m": "double",
+            "execution_cost": "double",
+            "net_close_delta": "double",
+            "net_max_favorable_delta": "double",
+            "net_max_adverse_delta": "double",
+            "paper_trade_positive": "boolean",
+            "paper_trade_strong": "boolean",
             "risk_tags": "json",
         },
     )
@@ -457,6 +534,17 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             "avg_max_adverse_delta": "double",
             "already_hot_rate": "double",
             "tradable_score": "double",
+            "micro_hit_rate": "double",
+            "median_time_to_price_in": "double",
+            "sub_10m_hit_rate": "double",
+            "late_after_price_move_rate": "double",
+        },
+    )
+    _ensure_columns(
+        con,
+        "live_burst_runs",
+        {
+            "updated_at": "timestamp",
         },
     )
 
@@ -542,6 +630,7 @@ def insert_market_tick(
     last_trade_price: Optional[float],
     liquidity: Optional[float],
     raw: object,
+    tick_source: str = "live",
 ) -> None:
     mid = None
     spread = None
@@ -565,7 +654,7 @@ def insert_market_tick(
             spread,
             last_trade_price,
             liquidity,
-            "live",
+            tick_source,
             utc_now_iso(),
             json.dumps(raw, ensure_ascii=False),
         ],
@@ -589,6 +678,27 @@ def insert_market_midpoint_tick(
         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [observed_at, market_slug, token_id, None, None, mid, None, None, liquidity, "live", utc_now_iso(), json.dumps(raw, ensure_ascii=False)],
+    )
+
+
+def insert_market_midpoint_tick_with_source(
+    con: duckdb.DuckDBPyConnection,
+    observed_at: str,
+    market_slug: Optional[str],
+    token_id: Optional[str],
+    mid: Optional[float],
+    liquidity: Optional[float],
+    raw: object,
+    tick_source: str = "live_burst",
+) -> None:
+    con.execute(
+        """
+        insert into market_ticks
+        (observed_at, market_slug, token_id, best_bid, best_ask, mid, spread, last_trade_price,
+         liquidity, tick_source, ingested_at, raw_json)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [observed_at, market_slug, token_id, None, None, mid, None, None, liquidity, tick_source, utc_now_iso(), json.dumps(raw, ensure_ascii=False)],
     )
 
 
@@ -768,6 +878,43 @@ def upsert_x_follow_graph(con: duckdb.DuckDBPyConnection, edges: Iterable[dict],
         insert or replace into x_follow_graph
         (source_handle, target_handle, relationship, collected_at)
         values (?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def upsert_signal_discovery_sources(
+    con: duckdb.DuckDBPyConnection,
+    rows_in: Iterable[dict],
+    created_at: Optional[str] = None,
+) -> int:
+    created_at = created_at or utc_now_iso()
+    rows = [
+        (
+            str(row.get("run_id") or stable_hash([row.get("platform"), row.get("handle"), row.get("market_slug"), created_at])[:16]),
+            str(row.get("platform") or "x"),
+            str(row.get("handle") or "").lstrip("@"),
+            str(row.get("market_slug") or ""),
+            row.get("first_seen_at"),
+            _int_or_none(row.get("post_count")) or 0,
+            _float_or_none(row.get("engagement_score")) or 0.0,
+            _float_or_none(row.get("discovery_score")) or 0.0,
+            row.get("recommended_status") or "watch",
+            json.dumps(row.get("evidence") or {}, ensure_ascii=False, sort_keys=True),
+            created_at,
+        )
+        for row in rows_in
+        if row.get("handle") and row.get("market_slug")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into signal_discovery_sources
+        (run_id, platform, handle, market_slug, first_seen_at, post_count,
+         engagement_score, discovery_score, recommended_status, evidence, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -1165,6 +1312,16 @@ def upsert_event_post_impacts(con: duckdb.DuckDBPyConnection, impacts: Iterable[
             bool(row.get("already_hot_penalty")),
             bool(row.get("crowded_entry")),
             bool(row.get("late_stage_ramp")),
+            row.get("price_data_resolution"),
+            _float_or_none(row.get("time_to_3pp_seconds")),
+            _float_or_none(row.get("max_move_10m")),
+            _float_or_none(row.get("reversal_30m")),
+            _float_or_none(row.get("execution_cost")),
+            _float_or_none(row.get("net_close_delta")),
+            _float_or_none(row.get("net_max_favorable_delta")),
+            _float_or_none(row.get("net_max_adverse_delta")),
+            bool(row.get("paper_trade_positive")),
+            bool(row.get("paper_trade_strong")),
             json.dumps(row.get("risk_tags") or [], ensure_ascii=False),
             evaluated_at,
         )
@@ -1180,8 +1337,11 @@ def upsert_event_post_impacts(con: duckdb.DuckDBPyConnection, impacts: Iterable[
          close_delta, max_favorable_delta, max_adverse_delta, entry_delay_seconds,
          price_in_time, ramp_duration_minutes, price_move_started_before_post,
          is_positive, is_strong, tradable_ramp, strong_ramp, already_hot_penalty,
-         crowded_entry, late_stage_ramp, risk_tags, evaluated_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         crowded_entry, late_stage_ramp, price_data_resolution, time_to_3pp_seconds,
+         max_move_10m, reversal_30m, execution_cost, net_close_delta,
+         net_max_favorable_delta, net_max_adverse_delta, paper_trade_positive,
+         paper_trade_strong, risk_tags, evaluated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -1206,6 +1366,10 @@ def upsert_event_account_metrics(con: duckdb.DuckDBPyConnection, metrics: Iterab
             _float_or_none(row.get("avg_max_adverse_delta")),
             _float_or_none(row.get("already_hot_rate")),
             _float_or_none(row.get("tradable_score")),
+            _float_or_none(row.get("micro_hit_rate")),
+            _float_or_none(row.get("median_time_to_price_in")),
+            _float_or_none(row.get("sub_10m_hit_rate")),
+            _float_or_none(row.get("late_after_price_move_rate")),
             row.get("recommended_status"),
             evaluated_at,
         )
@@ -1220,12 +1384,138 @@ def upsert_event_account_metrics(con: duckdb.DuckDBPyConnection, metrics: Iterab
         (account, case_id, lead_score, impact_score, hit_rate, false_fomo_rate,
          sample_size, ramp_hit_rate, strong_ramp_rate, avg_entry_delay_seconds,
          avg_max_favorable_delta, avg_max_adverse_delta, already_hot_rate,
-         tradable_score, recommended_status, evaluated_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         tradable_score, micro_hit_rate, median_time_to_price_in, sub_10m_hit_rate,
+         late_after_price_move_rate, recommended_status, evaluated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
     return len(rows)
+
+
+def upsert_post_market_semantic_matches(con: duckdb.DuckDBPyConnection, matches: Iterable[dict], created_at: Optional[str] = None) -> int:
+    created_at = created_at or utc_now_iso()
+    rows = [
+        (
+            row["case_id"],
+            str(row["post_id"]),
+            str(row["handle"]).lstrip("@"),
+            row["market_slug"],
+            row.get("method") or "semantic",
+            _float_or_none(row.get("similarity")),
+            json.dumps(row.get("matched_concepts") or [], ensure_ascii=False),
+            json.dumps(row.get("rejected_concepts") or [], ensure_ascii=False),
+            row.get("decision") or "matched",
+            created_at,
+        )
+        for row in matches
+        if row.get("case_id") and row.get("post_id") and row.get("handle") and row.get("market_slug")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into post_market_semantic_matches
+        (case_id, post_id, handle, market_slug, method, similarity, matched_concepts,
+         rejected_concepts, decision, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def upsert_live_burst_run(con: duckdb.DuckDBPyConnection, row: dict, updated_at: Optional[str] = None) -> None:
+    updated_at = updated_at or utc_now_iso()
+    run_id = row.get("run_id") or stable_hash([row.get("case_id"), row.get("post_id")])[:24]
+    con.execute("delete from live_burst_runs where run_id = ? or (case_id = ? and post_id = ?)", [run_id, row["case_id"], str(row["post_id"])])
+    con.execute(
+        """
+        insert into live_burst_runs
+        (run_id, case_id, post_id, handle, triggered_at, confidence, status,
+         planned_calls, ticks_written, error, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            run_id,
+            row["case_id"],
+            str(row["post_id"]),
+            row.get("handle"),
+            row.get("triggered_at") or updated_at,
+            _float_or_none(row.get("confidence")),
+            row.get("status") or "planned",
+            _int_or_none(row.get("planned_calls")) or 0,
+            _int_or_none(row.get("ticks_written")) or 0,
+            row.get("error"),
+            updated_at,
+        ],
+    )
+
+
+def live_burst_run_exists(con: duckdb.DuckDBPyConnection, case_id: str, post_id: str) -> bool:
+    row = con.execute(
+        "select 1 from live_burst_runs where case_id = ? and post_id = ? limit 1",
+        [case_id, str(post_id)],
+    ).fetchone()
+    return bool(row)
+
+
+def live_burst_trigger_candidates(
+    con: duckdb.DuckDBPyConnection,
+    case_ids: Sequence[str],
+    min_confidence: float,
+    limit: int = 1,
+    min_match_created_at: Optional[str] = None,
+    min_post_created_at: Optional[str] = None,
+) -> List[dict]:
+    if not case_ids:
+        return []
+    placeholders = ",".join(["?"] * len(case_ids))
+    rows = con.execute(
+        f"""
+        select m.case_id, m.post_id, m.handle, m.market_slug, m.similarity, m.created_at,
+               p.created_at as post_created_at, p.direction, p.text
+        from post_market_semantic_matches m
+        left join event_case_posts p on p.case_id = m.case_id and p.post_id = m.post_id
+        where m.method = 'cloud'
+          and coalesce(m.similarity, 0) >= ?
+          and (? is null or m.created_at >= ?)
+          and (? is null or p.created_at >= ?)
+          and m.case_id in ({placeholders})
+          and not exists (
+              select 1 from live_burst_runs r
+              where r.case_id = m.case_id and r.post_id = m.post_id
+          )
+        order by m.similarity desc, coalesce(p.created_at, m.created_at) asc
+        limit ?
+        """,
+        [
+            float(min_confidence),
+            min_match_created_at,
+            min_match_created_at,
+            min_post_created_at,
+            min_post_created_at,
+            *case_ids,
+            int(limit),
+        ],
+    ).fetchall()
+    columns = [desc[0] for desc in con.description]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def live_burst_runs_for_case(con: duckdb.DuckDBPyConnection, case_id: str) -> List[dict]:
+    rows = con.execute(
+        """
+        select run_id, case_id, post_id, handle, triggered_at, confidence, status,
+               planned_calls, ticks_written, error, updated_at
+        from live_burst_runs
+        where case_id = ?
+        order by triggered_at desc
+        """,
+        [case_id],
+    ).fetchall()
+    columns = [desc[0] for desc in con.description]
+    return [dict(zip(columns, row)) for row in rows]
 
 
 def record_telegram_alert(con: duckdb.DuckDBPyConnection, signal_id: str, payload: str, status: str, error: Optional[str] = None) -> None:
