@@ -244,7 +244,9 @@ def test_micro_backtest_scores_sub_10m_price_in(tmp_path) -> None:
     assert five_min["is_positive"]
     assert five_min["tradable_ramp"]
     assert five_min["time_to_3pp_seconds"] == 299
-    assert metrics[0]["recommended_status"] == "micro_source"
+    assert five_min["reward_to_risk"] > 1.5
+    assert five_min["risk_adjusted_edge"] > 0
+    assert metrics[0]["recommended_status"] == "needs_more_samples"
     assert metrics[0]["sub_10m_hit_rate"] == 1
 
 
@@ -289,6 +291,39 @@ def test_micro_backtest_marks_cost_erased_move_not_tradable(tmp_path) -> None:
     assert metrics[0]["recommended_status"] == "cost_erased_watch"
 
 
+def test_micro_backtest_penalizes_bad_reward_to_risk(tmp_path) -> None:
+    con = connect(tmp_path / "micro_rr.duckdb")
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+    _seed_case(con, now)
+    post_at = now + timedelta(minutes=1)
+    insert_historical_price_ticks(
+        con,
+        [
+            _tick(now, 0.40, source="live_burst"),
+            _tick(post_at + timedelta(seconds=1), 0.40, source="live_burst"),
+            _tick(post_at + timedelta(seconds=10), 0.35, source="live_burst"),
+            _tick(post_at + timedelta(minutes=1), 0.43, source="live_burst"),
+            _tick(post_at + timedelta(minutes=5), 0.48, source="live_burst"),
+        ],
+    )
+    store_event_case_posts(
+        con,
+        "trump_china",
+        [_post("p1", "RiskyAlpha", post_at, "Trump may visit Beijing for a Xi summit")],
+        ["trump", "china", "visit", "beijing", "summit"],
+    )
+
+    impacts, metrics = run_event_backtest(con, "trump_china", ["5m"], mode="micro")
+
+    impact = impacts[0]
+    assert impact["paper_trade_positive"]
+    assert not impact["tradable_ramp"]
+    assert impact["reward_to_risk"] < 1.5
+    assert "poor_reward_to_risk" in impact["risk_tags"]
+    assert "adverse_excursion" in impact["risk_tags"]
+    assert metrics[0]["recommended_status"] == "needs_more_samples"
+
+
 def test_micro_backtest_marks_minute_floor_for_sub_minute_history(tmp_path) -> None:
     con = connect(tmp_path / "minute_floor.duckdb")
     now = datetime(2026, 5, 15, tzinfo=timezone.utc)
@@ -318,7 +353,7 @@ def test_micro_backtest_marks_minute_floor_for_sub_minute_history(tmp_path) -> N
     assert "insufficient_resolution" in ten_sec["risk_tags"]
     assert not ten_sec["is_positive"]
     assert one_min["is_positive"]
-    assert metrics[0]["recommended_status"] in {"micro_source", "watch"}
+    assert metrics[0]["recommended_status"] in {"micro_source", "watch", "needs_more_samples"}
 
 
 def test_live_micro_evidence_report_uses_burst_runs(tmp_path) -> None:

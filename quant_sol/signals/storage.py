@@ -431,9 +431,138 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             net_max_adverse_delta double,
             paper_trade_positive boolean,
             paper_trade_strong boolean,
+            edge_after_cost double,
+            reward_to_risk double,
+            risk_adjusted_edge double,
             risk_tags json,
             evaluated_at timestamp not null,
             primary key (case_id, post_id, market_slug, horizon)
+        )
+        """
+    )
+    con.execute(
+        """
+        create table if not exists price_events (
+            price_event_id varchar primary key,
+            case_id varchar not null,
+            market_slug varchar not null,
+            token_id varchar,
+            start_at timestamp not null,
+            peak_at timestamp,
+            end_at timestamp not null,
+            direction varchar,
+            move_size double,
+            duration_seconds double,
+            pre_event_volatility double,
+            spread_at_start double,
+            liquidity_at_start double,
+            price_data_resolution varchar,
+            event_type varchar,
+            detection_config_hash varchar,
+            risk_tags json,
+            created_at timestamp not null
+        )
+        """
+    )
+    con.execute(
+        """
+        create table if not exists source_backfill_plans (
+            plan_id varchar primary key,
+            case_id varchar not null,
+            price_event_id varchar,
+            platform varchar not null,
+            query varchar not null,
+            window_start timestamp not null,
+            window_end timestamp not null,
+            planned_calls integer,
+            counts_json json,
+            status varchar not null,
+            reason varchar,
+            created_at timestamp not null
+        )
+        """
+    )
+    con.execute(
+        """
+        create table if not exists post_price_event_matches (
+            case_id varchar not null,
+            price_event_id varchar not null,
+            post_id varchar not null,
+            handle varchar not null,
+            market_slug varchar not null,
+            post_created_at timestamp,
+            lead_seconds double,
+            relative_position varchar,
+            match_confidence double,
+            direction varchar,
+            direction_agrees boolean,
+            method varchar not null,
+            matched_keywords json,
+            created_at timestamp not null,
+            primary key (case_id, price_event_id, post_id, method)
+        )
+        """
+    )
+    con.execute(
+        """
+        create table if not exists backtest_runs (
+            run_id varchar primary key,
+            case_id varchar not null,
+            run_type varchar not null,
+            execution_mode varchar,
+            horizons json,
+            config_hash varchar,
+            created_at timestamp not null,
+            notes varchar
+        )
+        """
+    )
+    con.execute(
+        """
+        create table if not exists backtest_samples (
+            run_id varchar not null,
+            sample_id varchar not null,
+            case_id varchar not null,
+            price_event_id varchar not null,
+            post_id varchar not null,
+            handle varchar not null,
+            market_slug varchar not null,
+            horizon varchar not null,
+            relative_position varchar,
+            entry_at timestamp,
+            entry_price double,
+            future_price double,
+            gross_delta double,
+            net_delta double,
+            max_favorable_delta double,
+            max_adverse_delta double,
+            execution_cost double,
+            reward_to_risk double,
+            risk_adjusted_edge double,
+            paper_trade_positive boolean,
+            risk_tags json,
+            created_at timestamp not null,
+            primary key (run_id, sample_id, horizon)
+        )
+        """
+    )
+    con.execute(
+        """
+        create table if not exists account_backtest_metrics (
+            run_id varchar not null,
+            case_id varchar not null,
+            handle varchar not null,
+            sample_size integer,
+            before_move_rate double,
+            during_move_rate double,
+            late_after_price_move_rate double,
+            tradable_hit_rate double,
+            false_fomo_rate double,
+            expectancy_after_cost double,
+            sample_confidence double,
+            recommended_status varchar,
+            created_at timestamp not null,
+            primary key (run_id, handle)
         )
         """
     )
@@ -520,6 +649,9 @@ def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
             "net_max_adverse_delta": "double",
             "paper_trade_positive": "boolean",
             "paper_trade_strong": "boolean",
+            "edge_after_cost": "double",
+            "reward_to_risk": "double",
+            "risk_adjusted_edge": "double",
             "risk_tags": "json",
         },
     )
@@ -1322,6 +1454,9 @@ def upsert_event_post_impacts(con: duckdb.DuckDBPyConnection, impacts: Iterable[
             _float_or_none(row.get("net_max_adverse_delta")),
             bool(row.get("paper_trade_positive")),
             bool(row.get("paper_trade_strong")),
+            _float_or_none(row.get("edge_after_cost")),
+            _float_or_none(row.get("reward_to_risk")),
+            _float_or_none(row.get("risk_adjusted_edge")),
             json.dumps(row.get("risk_tags") or [], ensure_ascii=False),
             evaluated_at,
         )
@@ -1340,8 +1475,9 @@ def upsert_event_post_impacts(con: duckdb.DuckDBPyConnection, impacts: Iterable[
          crowded_entry, late_stage_ramp, price_data_resolution, time_to_3pp_seconds,
          max_move_10m, reversal_30m, execution_cost, net_close_delta,
          net_max_favorable_delta, net_max_adverse_delta, paper_trade_positive,
-         paper_trade_strong, risk_tags, evaluated_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         paper_trade_strong, edge_after_cost, reward_to_risk, risk_adjusted_edge,
+         risk_tags, evaluated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -1518,6 +1654,306 @@ def live_burst_runs_for_case(con: duckdb.DuckDBPyConnection, case_id: str) -> Li
     return [dict(zip(columns, row)) for row in rows]
 
 
+def upsert_price_events(con: duckdb.DuckDBPyConnection, events: Iterable[dict], created_at: Optional[str] = None) -> int:
+    created_at = created_at or utc_now_iso()
+    rows = [
+        (
+            row["price_event_id"],
+            row["case_id"],
+            row["market_slug"],
+            row.get("token_id"),
+            row["start_at"],
+            row.get("peak_at"),
+            row["end_at"],
+            row.get("direction"),
+            _float_or_none(row.get("move_size")),
+            _float_or_none(row.get("duration_seconds")),
+            _float_or_none(row.get("pre_event_volatility")),
+            _float_or_none(row.get("spread_at_start")),
+            _float_or_none(row.get("liquidity_at_start")),
+            row.get("price_data_resolution"),
+            row.get("event_type"),
+            row.get("detection_config_hash"),
+            json.dumps(row.get("risk_tags") or [], ensure_ascii=False),
+            created_at,
+        )
+        for row in events
+        if row.get("price_event_id") and row.get("case_id") and row.get("market_slug") and row.get("start_at") and row.get("end_at")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into price_events
+        (price_event_id, case_id, market_slug, token_id, start_at, peak_at, end_at,
+         direction, move_size, duration_seconds, pre_event_volatility, spread_at_start,
+         liquidity_at_start, price_data_resolution, event_type, detection_config_hash,
+         risk_tags, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def price_events_for_case(con: duckdb.DuckDBPyConnection, case_id: str) -> List[dict]:
+    rows = con.execute(
+        """
+        select price_event_id, case_id, market_slug, token_id, start_at, peak_at, end_at,
+               direction, move_size, duration_seconds, pre_event_volatility,
+               spread_at_start, liquidity_at_start, price_data_resolution, event_type,
+               detection_config_hash, risk_tags, created_at
+        from price_events
+        where case_id = ?
+        order by start_at, move_size desc
+        """,
+        [case_id],
+    ).fetchall()
+    columns = [desc[0] for desc in con.description]
+    result = []
+    for row in rows:
+        item = dict(zip(columns, row))
+        item["risk_tags"] = _loads_json(item.get("risk_tags"), [])
+        result.append(item)
+    return result
+
+
+def upsert_source_backfill_plans(con: duckdb.DuckDBPyConnection, plans: Iterable[dict], created_at: Optional[str] = None) -> int:
+    created_at = created_at or utc_now_iso()
+    rows = [
+        (
+            row["plan_id"],
+            row["case_id"],
+            row.get("price_event_id"),
+            row.get("platform") or "x",
+            row["query"],
+            row["window_start"],
+            row["window_end"],
+            _int_or_none(row.get("planned_calls")) or 0,
+            json.dumps(row.get("counts") or {}, ensure_ascii=False, sort_keys=True),
+            row.get("status") or "planned",
+            row.get("reason"),
+            created_at,
+        )
+        for row in plans
+        if row.get("plan_id") and row.get("case_id") and row.get("query") and row.get("window_start") and row.get("window_end")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into source_backfill_plans
+        (plan_id, case_id, price_event_id, platform, query, window_start, window_end,
+         planned_calls, counts_json, status, reason, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def source_backfill_plans_for_case(con: duckdb.DuckDBPyConnection, case_id: str) -> List[dict]:
+    rows = con.execute(
+        """
+        select plan_id, case_id, price_event_id, platform, query, window_start, window_end,
+               planned_calls, counts_json, status, reason, created_at
+        from source_backfill_plans
+        where case_id = ?
+        order by created_at desc, window_start
+        """,
+        [case_id],
+    ).fetchall()
+    columns = [desc[0] for desc in con.description]
+    result = []
+    for row in rows:
+        item = dict(zip(columns, row))
+        item["counts"] = _loads_json(item.get("counts_json"), {})
+        result.append(item)
+    return result
+
+
+def upsert_post_price_event_matches(con: duckdb.DuckDBPyConnection, matches: Iterable[dict], created_at: Optional[str] = None) -> int:
+    created_at = created_at or utc_now_iso()
+    rows = [
+        (
+            row["case_id"],
+            row["price_event_id"],
+            str(row["post_id"]),
+            str(row["handle"]).lstrip("@"),
+            row["market_slug"],
+            row.get("post_created_at"),
+            _float_or_none(row.get("lead_seconds")),
+            row.get("relative_position"),
+            _float_or_none(row.get("match_confidence")),
+            row.get("direction"),
+            None if row.get("direction_agrees") is None else bool(row.get("direction_agrees")),
+            row.get("method") or "keyword",
+            json.dumps(row.get("matched_keywords") or [], ensure_ascii=False),
+            created_at,
+        )
+        for row in matches
+        if row.get("case_id") and row.get("price_event_id") and row.get("post_id") and row.get("handle") and row.get("market_slug")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into post_price_event_matches
+        (case_id, price_event_id, post_id, handle, market_slug, post_created_at,
+         lead_seconds, relative_position, match_confidence, direction, direction_agrees,
+         method, matched_keywords, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def post_price_event_matches_for_case(con: duckdb.DuckDBPyConnection, case_id: str) -> List[dict]:
+    rows = con.execute(
+        """
+        select case_id, price_event_id, post_id, handle, market_slug, post_created_at,
+               lead_seconds, relative_position, match_confidence, direction,
+               direction_agrees, method, matched_keywords, created_at
+        from post_price_event_matches
+        where case_id = ?
+        order by price_event_id, post_created_at
+        """,
+        [case_id],
+    ).fetchall()
+    columns = [desc[0] for desc in con.description]
+    result = []
+    for row in rows:
+        item = dict(zip(columns, row))
+        item["matched_keywords"] = _loads_json(item.get("matched_keywords"), [])
+        result.append(item)
+    return result
+
+
+def upsert_backtest_run(con: duckdb.DuckDBPyConnection, row: dict, created_at: Optional[str] = None) -> str:
+    created_at = created_at or utc_now_iso()
+    run_id = row.get("run_id") or stable_hash([row.get("case_id"), row.get("run_type"), row.get("horizons"), created_at])[:24]
+    con.execute(
+        """
+        insert or replace into backtest_runs
+        (run_id, case_id, run_type, execution_mode, horizons, config_hash, created_at, notes)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            run_id,
+            row["case_id"],
+            row.get("run_type") or "price_first",
+            row.get("execution_mode"),
+            json.dumps(row.get("horizons") or [], ensure_ascii=False),
+            row.get("config_hash"),
+            created_at,
+            row.get("notes"),
+        ],
+    )
+    return str(run_id)
+
+
+def upsert_backtest_samples(con: duckdb.DuckDBPyConnection, samples: Iterable[dict], created_at: Optional[str] = None) -> int:
+    created_at = created_at or utc_now_iso()
+    rows = [
+        (
+            row["run_id"],
+            row["sample_id"],
+            row["case_id"],
+            row["price_event_id"],
+            str(row["post_id"]),
+            str(row["handle"]).lstrip("@"),
+            row["market_slug"],
+            row["horizon"],
+            row.get("relative_position"),
+            row.get("entry_at"),
+            _float_or_none(row.get("entry_price")),
+            _float_or_none(row.get("future_price")),
+            _float_or_none(row.get("gross_delta")),
+            _float_or_none(row.get("net_delta")),
+            _float_or_none(row.get("max_favorable_delta")),
+            _float_or_none(row.get("max_adverse_delta")),
+            _float_or_none(row.get("execution_cost")),
+            _float_or_none(row.get("reward_to_risk")),
+            _float_or_none(row.get("risk_adjusted_edge")),
+            bool(row.get("paper_trade_positive")),
+            json.dumps(row.get("risk_tags") or [], ensure_ascii=False),
+            created_at,
+        )
+        for row in samples
+        if row.get("run_id") and row.get("sample_id") and row.get("case_id") and row.get("price_event_id") and row.get("post_id")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into backtest_samples
+        (run_id, sample_id, case_id, price_event_id, post_id, handle, market_slug,
+         horizon, relative_position, entry_at, entry_price, future_price, gross_delta,
+         net_delta, max_favorable_delta, max_adverse_delta, execution_cost,
+         reward_to_risk, risk_adjusted_edge, paper_trade_positive, risk_tags, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def upsert_account_backtest_metrics(con: duckdb.DuckDBPyConnection, metrics: Iterable[dict], created_at: Optional[str] = None) -> int:
+    created_at = created_at or utc_now_iso()
+    rows = [
+        (
+            row["run_id"],
+            row["case_id"],
+            str(row["handle"]).lstrip("@"),
+            _int_or_none(row.get("sample_size")) or 0,
+            _float_or_none(row.get("before_move_rate")),
+            _float_or_none(row.get("during_move_rate")),
+            _float_or_none(row.get("late_after_price_move_rate")),
+            _float_or_none(row.get("tradable_hit_rate")),
+            _float_or_none(row.get("false_fomo_rate")),
+            _float_or_none(row.get("expectancy_after_cost")),
+            _float_or_none(row.get("sample_confidence")),
+            row.get("recommended_status"),
+            created_at,
+        )
+        for row in metrics
+        if row.get("run_id") and row.get("case_id") and row.get("handle")
+    ]
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        insert or replace into account_backtest_metrics
+        (run_id, case_id, handle, sample_size, before_move_rate, during_move_rate,
+         late_after_price_move_rate, tradable_hit_rate, false_fomo_rate,
+         expectancy_after_cost, sample_confidence, recommended_status, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def latest_backtest_run(con: duckdb.DuckDBPyConnection, case_id: str, run_type: str = "price_first") -> Optional[dict]:
+    row = con.execute(
+        """
+        select run_id, case_id, run_type, execution_mode, horizons, config_hash, created_at, notes
+        from backtest_runs
+        where case_id = ? and run_type = ?
+        order by created_at desc
+        limit 1
+        """,
+        [case_id, run_type],
+    ).fetchone()
+    if not row:
+        return None
+    columns = [desc[0] for desc in con.description]
+    item = dict(zip(columns, row))
+    item["horizons"] = _loads_json(item.get("horizons"), [])
+    return item
+
+
 def record_telegram_alert(con: duckdb.DuckDBPyConnection, signal_id: str, payload: str, status: str, error: Optional[str] = None) -> None:
     con.execute(
         """
@@ -1624,6 +2060,17 @@ def _float_or_none(value: object) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _loads_json(value: object, default):
+    if value is None:
+        return default
+    if isinstance(value, (list, dict)):
+        return value
+    try:
+        return json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
 
 
 def _bool_or_none(value: object) -> Optional[bool]:

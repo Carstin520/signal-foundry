@@ -57,6 +57,15 @@ from .history import (
     x_case_query,
     x_time,
 )
+from .price_first import (
+    DEFAULT_PRICE_FIRST_HORIZONS,
+    DEFAULT_PRICE_WINDOWS,
+    match_price_events as match_price_events_case,
+    mine_price_events as mine_price_events_case,
+    plan_source_backfill as plan_source_backfill_case,
+    run_price_first_backtest as run_price_first_backtest_case,
+    write_price_first_report,
+)
 from .reporting import write_signal_report
 from .scoring import evaluate_signal_outcomes, score_recent, should_alert
 from .storage import (
@@ -70,6 +79,7 @@ from .storage import (
     insert_market_tick,
     live_burst_run_exists,
     live_burst_trigger_candidates,
+    price_events_for_case,
     record_api_call,
     record_telegram_alert,
     replace_wallet_activity,
@@ -691,6 +701,132 @@ def report_event_backtest(
     """Write a local markdown historical event backtest report."""
     path = write_event_backtest_report(connect(), case, SIGNAL_REPORT_ROOT)
     console.print(f"Wrote event backtest report: {path}")
+
+
+@app.command("mine-price-events")
+def mine_price_events(
+    case: str = typer.Option(..., "--case", help="Historical event case id."),
+    windows: str = typer.Option(",".join(DEFAULT_PRICE_WINDOWS), "--windows", help="Comma-separated rolling windows."),
+    min_move_pp: float = typer.Option(3.0, "--min-move-pp", help="Minimum absolute move in percentage points."),
+) -> None:
+    """Mine price-first repricing events from local market_ticks."""
+    window_values = [part.strip() for part in windows.split(",") if part.strip()]
+    events = mine_price_events_case(connect(), case, window_values, min_move_pp=min_move_pp)
+    console.print(f"Mined {len(events)} price event(s) for {case}.")
+    table = Table(title="Price Events")
+    table.add_column("Start")
+    table.add_column("Type")
+    table.add_column("Direction")
+    table.add_column("Move", justify="right")
+    table.add_column("Resolution")
+    table.add_column("Tags")
+    for event in events[:20]:
+        table.add_row(
+            str(event.get("start_at")),
+            str(event.get("event_type")),
+            str(event.get("direction")),
+            _fmt(event.get("move_size")),
+            str(event.get("price_data_resolution")),
+            ", ".join(event.get("risk_tags") or []),
+        )
+    console.print(table)
+
+
+@app.command("plan-source-backfill")
+def plan_source_backfill(
+    case: str = typer.Option(..., "--case", help="Historical event case id."),
+    pre: str = typer.Option("6h", "--pre", help="Lookback before price event start."),
+    post: str = typer.Option("30m", "--post", help="Lookahead after price event start."),
+    platform: str = typer.Option("x", "--platform", help="Source platform. V1 supports x."),
+    use_counts: bool = typer.Option(True, "--use-counts/--no-counts", help="Use X counts preflight when credentials are available."),
+    daily_cap: int = typer.Option(200, "--daily-cap", help="Local daily X call cap."),
+    max_count: int = typer.Option(500, "--max-count", help="Mark plans too expensive above this count."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show planning result without writing plans or calling X."),
+) -> None:
+    """Plan bounded source searches around mined price events."""
+    if platform != "x":
+        console.print(f"[yellow]Unsupported platform '{platform}'. V1 supports x.[/yellow]")
+        return
+    con = connect()
+    events = price_events_for_case(con, case)
+    token = os.getenv("X_BEARER_TOKEN")
+    planned_calls = len(events) if use_counts and token else 0
+    if use_counts and token and not _check_x_budget(con, planned_calls, daily_cap, dry_run, f"plan-source-backfill case={case}"):
+        return
+    count_provider = None
+    if use_counts and token and not dry_run:
+        client = XApiClient(token)
+
+        def count_provider(query: str, start_time: str, end_time: str) -> dict:
+            payload = client.full_archive_counts(query, start_time, end_time)
+            record_api_call(con, "x", "tweets/counts/all", notes=f"price-first case={case}")
+            return payload
+
+    try:
+        plans = plan_source_backfill_case(
+            con,
+            case,
+            pre=pre,
+            post=post,
+            platform=platform,
+            use_counts=use_counts,
+            daily_cap=daily_cap,
+            max_count=max_count,
+            count_provider=count_provider,
+            write=not dry_run,
+        )
+    except RequestException as exc:
+        if _http_status(exc) in {401, 403}:
+            console.print("[yellow]X full-archive counts are unavailable for this token. Plan without --use-counts or upgrade X access.[/yellow]")
+            return
+        raise
+    console.print(f"Planned {len(plans)} source backfill window(s) for {case}.")
+    table = Table(title="Source Backfill Plans")
+    table.add_column("Status")
+    table.add_column("Event")
+    table.add_column("Calls", justify="right")
+    table.add_column("Reason")
+    for plan in plans[:30]:
+        table.add_row(str(plan.get("status")), str(plan.get("price_event_id")), _fmt(plan.get("planned_calls")), str(plan.get("reason") or ""))
+    console.print(table)
+
+
+@app.command("match-price-events")
+def match_price_events(
+    case: str = typer.Option(..., "--case", help="Historical event case id."),
+    method: str = typer.Option("keyword", "--method", help="Matching method: keyword or cloud."),
+    min_confidence: float = typer.Option(0.70, "--min-confidence", help="Minimum match confidence."),
+) -> None:
+    """Match local posts to mined price events."""
+    if method not in {"keyword", "cloud"}:
+        console.print("[yellow]Unsupported method. Use keyword or cloud.[/yellow]")
+        return
+    matches = match_price_events_case(connect(), case, method=method, min_confidence=min_confidence)
+    console.print(f"Matched {len(matches)} post-price-event row(s) for {case}.")
+
+
+@app.command("run-price-first-backtest")
+def run_price_first_backtest(
+    case: str = typer.Option(..., "--case", help="Historical event case id."),
+    horizons: str = typer.Option(",".join(DEFAULT_PRICE_FIRST_HORIZONS), "--horizons", help="Comma-separated horizons."),
+    execution: str = typer.Option("top-of-book", "--execution", help="Execution assumption. V1 supports top-of-book."),
+) -> None:
+    """Run price-first historical backtest from matched post/price-event rows."""
+    if execution != "top-of-book":
+        console.print("[yellow]Unsupported execution mode. V1 supports top-of-book.[/yellow]")
+        return
+    horizon_values = [part.strip() for part in horizons.split(",") if part.strip()]
+    run_id, samples, metrics = run_price_first_backtest_case(connect(), case, horizon_values, execution=execution)
+    console.print(f"Price-first run {run_id}: wrote {len(samples)} sample row(s), {len(metrics)} account metric row(s).")
+
+
+@app.command("report-price-first-backtest")
+def report_price_first_backtest(
+    case: str = typer.Option(..., "--case", help="Historical event case id."),
+) -> None:
+    """Write a local markdown price-first historical backtest report."""
+    path = write_price_first_report(connect(), case, SIGNAL_REPORT_ROOT)
+    console.print(f"Wrote price-first backtest report: {path}")
 
 
 @app.command("export-account-seeds")

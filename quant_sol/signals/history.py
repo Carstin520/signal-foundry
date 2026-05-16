@@ -149,6 +149,11 @@ PAPER_TRADE_MIN_ROUND_TRIP_COST = 0.01
 PAPER_TRADE_SLIPPAGE_BUFFER = 0.002
 PAPER_TRADE_MIN_EDGE = 0.03
 PAPER_TRADE_STRONG_EDGE = 0.08
+PAPER_TRADE_MAX_ADVERSE = 0.04
+PAPER_TRADE_MIN_REWARD_TO_RISK = 1.5
+PAPER_TRADE_MIN_RISK_ADJUSTED_EDGE = 0.015
+MICRO_SOURCE_MIN_SAMPLES = 3
+MICRO_SOURCE_FULL_CONFIDENCE_SAMPLES = 8
 
 
 def slugify_case_id(query: str) -> str:
@@ -326,8 +331,8 @@ def write_event_backtest_report(con: duckdb.DuckDBPyConnection, case_id: str, re
                 "",
                 "## Micro Ladder",
                 "",
-                "| Account | Horizon | Entry Delay | Entry | Future | Move | Net Move | Cost | Time To 3pp | Max 10m | Net Max Fav | Reversal 30m | Resolution | Tags |",
-                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+                "| Account | Horizon | Entry Delay | Entry | Future | Move | Net Move | Cost | Edge | R/R | Risk Adj | Time To 3pp | Max 10m | Net Max Fav | Reversal 30m | Resolution | Tags |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
             ]
         )
         for row in micro_rows[:120]:
@@ -336,7 +341,9 @@ def write_event_backtest_report(con: duckdb.DuckDBPyConnection, case_id: str, re
                 f"{_fmt(row.get('entry_mid'))} | {_fmt(row.get('future_mid'))} | "
                 f"{_fmt(row.get('close_delta') if row.get('close_delta') is not None else row.get('delta'))} | "
                 f"{_fmt(row.get('net_close_delta'))} | {_fmt(row.get('execution_cost'))} | "
-                f"{_fmt(row.get('time_to_3pp_seconds'))} | {_fmt(row.get('max_move_10m'))} | "
+                f"{_fmt(row.get('edge_after_cost'))} | {_fmt(row.get('reward_to_risk'))} | "
+                f"{_fmt(row.get('risk_adjusted_edge'))} | {_fmt(row.get('time_to_3pp_seconds'))} | "
+                f"{_fmt(row.get('max_move_10m'))} | "
                 f"{_fmt(row.get('net_max_favorable_delta'))} | {_fmt(row.get('reversal_30m'))} | "
                 f"{row.get('price_data_resolution') or 'n/a'} | "
                 f"{', '.join(row.get('risk_tags') or [])} |"
@@ -347,8 +354,8 @@ def write_event_backtest_report(con: duckdb.DuckDBPyConnection, case_id: str, re
                 "",
                 "## Live Micro Evidence",
                 "",
-                "| Trigger | Account | Confidence | Status | Ticks | 1s | 10s | 30s | 1m | 5m | 10m | Net 10m | Cost | Time To 3pp | Max 10m | Reversal 30m |",
-                "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "| Trigger | Account | Confidence | Status | Ticks | 1s | 10s | 30s | 1m | 5m | 10m | Net 10m | Cost | R/R | Time To 3pp | Max 10m | Reversal 30m |",
+                "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         by_post = defaultdict(list)
@@ -365,6 +372,7 @@ def write_event_backtest_report(con: duckdb.DuckDBPyConnection, case_id: str, re
                 f"{_fmt(_row_move(by_horizon.get('30s')))} | {_fmt(_row_move(by_horizon.get('1m')))} | "
                 f"{_fmt(_row_move(by_horizon.get('5m')))} | {_fmt(_row_move(by_horizon.get('10m')))} | "
                 f"{_fmt(_row_net_move(by_horizon.get('10m')))} | {_fmt(best.get('execution_cost') if best else None)} | "
+                f"{_fmt(best.get('reward_to_risk') if best else None)} | "
                 f"{_fmt(best.get('time_to_3pp_seconds') if best else None)} | "
                 f"{_fmt(best.get('max_move_10m') if best else None)} | "
                 f"{_fmt(best.get('reversal_30m') if best else None)} |"
@@ -374,12 +382,12 @@ def write_event_backtest_report(con: duckdb.DuckDBPyConnection, case_id: str, re
             "",
             "## Ramp Opportunity",
             "",
-            "| Account | Horizon | Entry | Entry Delay | Max Fav | Net Fav | Max Adv | Close | Net Close | Cost | Price-In Time | Ramp Mins | Tags | Tradable |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- | --- |",
+            "| Account | Horizon | Entry | Entry Delay | Max Fav | Net Fav | Max Adv | Close | Net Close | Cost | R/R | Risk Adj | Price-In Time | Ramp Mins | Tags | Tradable |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- | --- |",
         ]
     )
     if not ramp_rows:
-        lines.append("| n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | no_matched_posts | False |")
+        lines.append("| n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | no_matched_posts | False |")
     for row in ramp_rows[:80]:
         lines.append(
             f"| @{row['handle']} | {row['horizon']} | {_fmt(row['entry_mid'])} | "
@@ -387,6 +395,7 @@ def write_event_backtest_report(con: duckdb.DuckDBPyConnection, case_id: str, re
             f"{_fmt(row.get('net_max_favorable_delta'))} | {_fmt(row['max_adverse_delta'])} | "
             f"{_fmt(row.get('close_delta') if row.get('close_delta') is not None else row.get('delta'))} | "
             f"{_fmt(row.get('net_close_delta'))} | {_fmt(row.get('execution_cost'))} | "
+            f"{_fmt(row.get('reward_to_risk'))} | {_fmt(row.get('risk_adjusted_edge'))} | "
             f"{row.get('price_in_time') or 'n/a'} | {_fmt(row.get('ramp_duration_minutes'))} | "
             f"{', '.join(row.get('risk_tags') or [])} | {row.get('tradable_ramp')} |"
         )
@@ -408,8 +417,8 @@ def write_event_backtest_report(con: duckdb.DuckDBPyConnection, case_id: str, re
             "",
             "## Price Impact Samples",
             "",
-            "| Account | Horizon | Entry | Future | Delta | Net Delta | Favorable | Net Favorable | Adverse | Late To Price | Positive | Paper Positive |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
+            "| Account | Horizon | Entry | Future | Delta | Net Delta | Favorable | Net Favorable | Adverse | R/R | Risk Adj | Late To Price | Positive | Paper Positive |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
         ]
     )
     for row in impacts[:80]:
@@ -417,7 +426,8 @@ def write_event_backtest_report(con: duckdb.DuckDBPyConnection, case_id: str, re
             f"| @{row['handle']} | {row['horizon']} | {_fmt(row['entry_mid'])} | {_fmt(row['future_mid'])} | "
             f"{_fmt(row['delta'])} | {_fmt(row.get('net_close_delta'))} | "
             f"{_fmt(row['max_favorable_delta'])} | {_fmt(row.get('net_max_favorable_delta'))} | "
-            f"{_fmt(row['max_adverse_delta'])} | {row['price_move_started_before_post']} | "
+            f"{_fmt(row['max_adverse_delta'])} | {_fmt(row.get('reward_to_risk'))} | "
+            f"{_fmt(row.get('risk_adjusted_edge'))} | {row['price_move_started_before_post']} | "
             f"{row['is_positive']} | {row.get('paper_trade_positive')} |"
         )
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -652,6 +662,9 @@ def _micro_post_impacts(case_id: str, market_slug: str, posts: Sequence[dict], t
                         net_close_delta=None,
                         net_max_favorable=None,
                         net_max_adverse=None,
+                        edge_after_cost=None,
+                        reward_to_risk=None,
+                        risk_adjusted_edge=None,
                         paper_trade_positive=False,
                         paper_trade_strong=False,
                     )
@@ -680,6 +693,9 @@ def _micro_post_impacts(case_id: str, market_slug: str, posts: Sequence[dict], t
             close_delta = _signed_or_abs_move(future_mid - entry_mid, sign)
             execution_cost = _round_trip_execution_cost(entry, window[-1])
             net_close_delta = close_delta - execution_cost
+            edge_after_cost = net_max_favorable
+            reward_to_risk = _reward_to_risk(net_max_favorable, net_max_adverse, execution_cost)
+            risk_adjusted_edge = _risk_adjusted_edge(net_max_favorable, net_max_adverse)
             price_tick = _first_threshold_tick(window, entry_mid, sign, threshold=0.03)
             time_to_3pp = None
             price_in_time = None
@@ -692,12 +708,33 @@ def _micro_post_impacts(case_id: str, market_slug: str, posts: Sequence[dict], t
             micro_hit = (not insufficient) and (max_favorable >= 0.03)
             strong_micro = (not insufficient) and (max_favorable >= 0.08 and max_adverse > -0.05)
             paper_trade_positive = (not insufficient) and (net_max_favorable >= PAPER_TRADE_MIN_EDGE)
-            paper_trade_strong = (not insufficient) and (net_max_favorable >= PAPER_TRADE_STRONG_EDGE and net_max_adverse > -0.05)
+            paper_trade_strong = (
+                (not insufficient)
+                and (net_max_favorable >= PAPER_TRADE_STRONG_EDGE)
+                and (net_max_adverse > -PAPER_TRADE_MAX_ADVERSE)
+                and reward_to_risk is not None
+                and reward_to_risk >= 2.0
+            )
             if micro_hit and not paper_trade_positive:
                 risk_tags.append("cost_erased_move")
             if execution_cost >= 0.02:
                 risk_tags.append("high_execution_cost")
-            tradable = micro_hit and paper_trade_positive and entry_delay <= 60 and not late_after_price_move
+            if paper_trade_positive and reward_to_risk is not None and reward_to_risk < PAPER_TRADE_MIN_REWARD_TO_RISK:
+                risk_tags.append("poor_reward_to_risk")
+            if paper_trade_positive and net_max_adverse <= -PAPER_TRADE_MAX_ADVERSE:
+                risk_tags.append("adverse_excursion")
+            if paper_trade_positive and risk_adjusted_edge < PAPER_TRADE_MIN_RISK_ADJUSTED_EDGE:
+                risk_tags.append("thin_risk_adjusted_edge")
+            tradable = (
+                micro_hit
+                and paper_trade_positive
+                and reward_to_risk is not None
+                and reward_to_risk >= PAPER_TRADE_MIN_REWARD_TO_RISK
+                and net_max_adverse > -PAPER_TRADE_MAX_ADVERSE
+                and risk_adjusted_edge >= PAPER_TRADE_MIN_RISK_ADJUSTED_EDGE
+                and entry_delay <= 60
+                and not late_after_price_move
+            )
             impacts.append(
                 _micro_impact_row(
                     case_id,
@@ -725,6 +762,9 @@ def _micro_post_impacts(case_id: str, market_slug: str, posts: Sequence[dict], t
                     net_close_delta=net_close_delta,
                     net_max_favorable=net_max_favorable,
                     net_max_adverse=net_max_adverse,
+                    edge_after_cost=edge_after_cost,
+                    reward_to_risk=reward_to_risk,
+                    risk_adjusted_edge=risk_adjusted_edge,
                     paper_trade_positive=paper_trade_positive,
                     paper_trade_strong=paper_trade_strong,
                 )
@@ -987,31 +1027,41 @@ def _micro_account_metrics(case_id: str, posts: Sequence[dict], impacts: Sequenc
         late_rate = late / len(usable) if usable else 0
         sub_10m_rate = sub_10m / len(usable) if usable else 0
         false_fomo = 1 - paper_hit_rate if usable else None
+        sample_confidence = min(1.0, len(usable) / MICRO_SOURCE_FULL_CONFIDENCE_SAMPLES) if usable else 0.0
+        shrunk_paper_hit_rate = (paper_hits + 1) / (len(usable) + 2) if usable else 0.0
+        shrunk_sub_10m_rate = (sub_10m + 1) / (len(usable) + 2) if usable else 0.0
         lead_score = max(0, 25 - lead_rank.get(account, 5) * 5)
         avg_fav = _avg(row.get("max_favorable_delta") for row in usable) or 0
         avg_adv = _avg(row.get("max_adverse_delta") for row in usable) or 0
+        avg_reward_to_risk = _avg(row.get("reward_to_risk") for row in usable) or 0
+        avg_risk_adjusted_edge = _avg(row.get("risk_adjusted_edge") for row in usable) or 0
         median_ttp = _median(row.get("time_to_3pp_seconds") for row in usable)
-        tradable_score = max(
+        raw_tradable_score = max(
             0.0,
             min(
                 100.0,
-                paper_hit_rate * 35
-                + sub_10m_rate * 25
+                shrunk_paper_hit_rate * 30
+                + shrunk_sub_10m_rate * 20
                 + strong_rate * 15
                 + min(15.0, avg_fav * 250)
+                + min(10.0, max(0.0, avg_risk_adjusted_edge) * 350)
+                + min(7.5, max(0.0, avg_reward_to_risk) * 1.5)
                 + lead_score * 0.25
                 - late_rate * 20
                 - max(0.0, -avg_adv) * 80,
             ),
         )
-        if tradable > 0 and paper_hits > 0 and sub_10m > 0:
+        tradable_score = raw_tradable_score * (0.35 + 0.65 * sample_confidence)
+        if samples and not usable:
+            status = "insufficient_resolution"
+        elif len(usable) < MICRO_SOURCE_MIN_SAMPLES and paper_hits > 0:
+            status = "needs_more_samples"
+        elif tradable > 0 and paper_hits > 0 and sub_10m > 0:
             status = "micro_source"
         elif paper_hits > 0:
             status = "watch"
         elif hits > 0:
             status = "cost_erased_watch"
-        elif samples and not usable:
-            status = "insufficient_resolution"
         else:
             status = "noise_or_no_micro_ramp"
         rows.append(
@@ -1321,6 +1371,7 @@ def _event_impacts(con: duckdb.DuckDBPyConnection, case_id: str) -> list[dict]:
                time_to_3pp_seconds, max_move_10m, reversal_30m,
                execution_cost, net_close_delta, net_max_favorable_delta,
                net_max_adverse_delta, paper_trade_positive, paper_trade_strong,
+               edge_after_cost, reward_to_risk, risk_adjusted_edge,
                risk_tags
         from event_post_impacts
         where case_id = ?
@@ -1430,6 +1481,9 @@ def _micro_impact_row(
     net_close_delta: Optional[float] = None,
     net_max_favorable: Optional[float] = None,
     net_max_adverse: Optional[float] = None,
+    edge_after_cost: Optional[float] = None,
+    reward_to_risk: Optional[float] = None,
+    risk_adjusted_edge: Optional[float] = None,
     paper_trade_positive: bool = False,
     paper_trade_strong: bool = False,
 ) -> dict:
@@ -1465,6 +1519,9 @@ def _micro_impact_row(
         "net_close_delta": net_close_delta,
         "net_max_favorable_delta": net_max_favorable,
         "net_max_adverse_delta": net_max_adverse,
+        "edge_after_cost": edge_after_cost,
+        "reward_to_risk": reward_to_risk,
+        "risk_adjusted_edge": risk_adjusted_edge,
         "paper_trade_positive": paper_trade_positive,
         "paper_trade_strong": paper_trade_strong,
         "risk_tags": list(dict.fromkeys(risk_tags)),
@@ -1503,6 +1560,20 @@ def _round_trip_execution_cost(entry_tick: Mapping[str, object], exit_tick: Opti
     missing_halves = int(entry_half is None) + int(exit_half is None)
     fallback_cost = missing_halves * (PAPER_TRADE_MIN_ROUND_TRIP_COST / 2)
     return max(PAPER_TRADE_MIN_ROUND_TRIP_COST, known_cost + fallback_cost + PAPER_TRADE_SLIPPAGE_BUFFER)
+
+
+def _reward_to_risk(net_max_favorable: Optional[float], net_max_adverse: Optional[float], execution_cost: Optional[float]) -> Optional[float]:
+    if net_max_favorable is None or net_max_favorable <= 0:
+        return None
+    adverse = abs(min(0.0, float(net_max_adverse or 0.0)))
+    denominator = max(adverse, float(execution_cost or 0.0), PAPER_TRADE_MIN_ROUND_TRIP_COST / 2)
+    return net_max_favorable / denominator
+
+
+def _risk_adjusted_edge(net_max_favorable: Optional[float], net_max_adverse: Optional[float]) -> Optional[float]:
+    if net_max_favorable is None or net_max_adverse is None:
+        return None
+    return float(net_max_favorable) + min(0.0, float(net_max_adverse))
 
 
 def _half_spread(tick: Optional[Mapping[str, object]]) -> Optional[float]:
