@@ -100,6 +100,10 @@ def score_market_fomo(
     early_wallet_confirmation_score = min(10, int(sum(abs(float(flow.get("notional") or 0)) for flow in wallet_flows) / 25_000))
     risk_tags = _risk_tags(state, direction, narrative_items, confirmation_items, handle_meta, config)
     anti_front_run_penalty = _anti_front_run_penalty(risk_tags)
+    edge_classification = _edge_classification(direction, risk_tags)
+    tradability = _tradability_assessment(state, risk_tags, config)
+    participant_lens = _participant_lens(state, risk_tags, direction, config)
+    data_provenance = _data_provenance(state, wallet_flows, confirmation_items)
 
     raw_score = (
         source_quality_score
@@ -129,6 +133,10 @@ def score_market_fomo(
         "post_count_1h": _snapshot_value(snapshots, "1h", "post_count"),
         "post_count_6h": _snapshot_value(snapshots, "6h", "post_count"),
         "post_count_24h": _snapshot_value(snapshots, "24h", "post_count"),
+        "edge_classification": edge_classification,
+        "tradability": tradability,
+        "participant_lens": participant_lens,
+        "data_provenance": data_provenance,
     }
     price_window = {
         "current_market_probability": state.get("mid"),
@@ -143,6 +151,9 @@ def score_market_fomo(
         "fomo_capacity": state.get("fomo_capacity"),
         "confirmation_status": "confirmed_or_officially_annotated" if confirmation_items else "unconfirmed",
         "price_band": state.get("price_band"),
+        "edge_classification": edge_classification,
+        "tradability_status": tradability["status"],
+        "cost_first_failure": tradability["cost_first_failure"],
     }
 
     return (
@@ -176,10 +187,16 @@ def should_alert(signal: SignalScore, threshold: Optional[int] = None) -> bool:
         "crowded_trade",
         "lottery_tail",
         "low_liquidity_pump",
+        "social_only_no_price_move",
     }
     if signal.score < threshold_value or blocked.intersection(signal.risk_tags):
         return False
     evidence = signal.evidence
+    if evidence.get("edge_classification") != "narrative_fomo_edge":
+        return False
+    tradability = evidence.get("tradability") if isinstance(evidence.get("tradability"), dict) else {}
+    if tradability.get("status") != "tradable_candidate":
+        return False
     return (
         int(evidence.get("social_velocity_score") or 0) >= 10
         and int(evidence.get("market_inertia_score") or 0) >= 8
@@ -412,6 +429,7 @@ def _risk_tags(
         tags.append("watch_only")
     if state.get("mid") is None:
         tags.append("no_market_price")
+        tags.append("social_only_no_price_move")
     if state.get("price_band") in {"lottery_tail", "crowded"}:
         tags.append("lottery_tail" if state.get("price_band") == "lottery_tail" else "crowded_trade")
     deadline_days = state.get("deadline_days")
@@ -424,12 +442,16 @@ def _risk_tags(
     if abs(float(state.get("move_6h") or 0)) >= config.already_moved_6h or abs(float(state.get("move_24h") or 0)) >= config.already_moved_24h:
         tags.append("already_priced_in")
     if state.get("liquidity") is not None and float(state["liquidity"]) < config.minimum_liquidity:
+        tags.append("thin_liquidity")
         tags.append("not_executable")
     if state.get("spread") is not None and float(state["spread"]) > config.max_spread:
+        tags.append("wide_spread")
         tags.append("not_executable")
     handles = {str(post.get("handle") or "").lower() for _, post in narrative_items}
     if len(narrative_items) >= 3 and len(handles) <= 1:
-        tags.append("low_liquidity_pump")
+        tags.append("single_source_narrative")
+        if state.get("liquidity") is None or float(state.get("liquidity") or 0) < config.minimum_liquidity:
+            tags.append("low_liquidity_pump")
     if len(narrative_items) < 2:
         tags.append("weak_narrative")
     return sorted(dict.fromkeys(tags))
@@ -448,8 +470,134 @@ def _anti_front_run_penalty(tags: Sequence[str]) -> int:
         "weak_narrative": 8,
         "no_market_price": 10,
         "low_liquidity_pump": 15,
+        "single_source_narrative": 6,
+        "wide_spread": 10,
+        "thin_liquidity": 12,
+        "social_only_no_price_move": 10,
     }
     return min(60, sum(weights.get(tag, 0) for tag in tags))
+
+
+def _edge_classification(direction: str, risk_tags: Sequence[str]) -> str:
+    tags = set(risk_tags)
+    if "confirmed_news" in tags:
+        return "confirmed_news_reaction"
+    if "no_market_price" in tags:
+        return "social_only_context"
+    if "already_priced_in" in tags:
+        return "late_or_priced_in_narrative"
+    if direction == "watch_only":
+        return "watch_only_context"
+    if "not_executable" in tags:
+        return "liquidity_constrained_narrative"
+    if "weak_narrative" in tags:
+        return "weak_narrative_context"
+    return "narrative_fomo_edge"
+
+
+def _tradability_assessment(state: Mapping[str, object], risk_tags: Sequence[str], config: FomoModelConfig) -> dict:
+    tags = set(risk_tags)
+    cost_first_failure = "none"
+    if "no_market_price" in tags:
+        cost_first_failure = "missing_price"
+    elif "near_deadline_rejected" in tags:
+        cost_first_failure = "deadline"
+    elif "thin_liquidity" in tags:
+        cost_first_failure = "liquidity"
+    elif "wide_spread" in tags:
+        cost_first_failure = "spread"
+    elif "already_priced_in" in tags:
+        cost_first_failure = "late_price_move"
+    elif "crowded_trade" in tags or "lottery_tail" in tags:
+        cost_first_failure = "price_band"
+    elif "watch_only" in tags:
+        cost_first_failure = "direction_unknown"
+    elif "weak_narrative" in tags:
+        cost_first_failure = "sample_size"
+
+    blocking = {
+        "confirmed_news",
+        "near_deadline_rejected",
+        "already_priced_in",
+        "not_executable",
+        "watch_only",
+        "crowded_trade",
+        "lottery_tail",
+        "no_market_price",
+    }
+    status = "tradable_candidate" if not blocking.intersection(tags) else "blocked"
+    if status == "tradable_candidate" and "weak_narrative" in tags:
+        status = "research_only"
+
+    liquidity = _coerce_float(state.get("liquidity"))
+    spread = _coerce_float(state.get("spread"))
+    liquidity_score = 0 if liquidity is None else min(40, int(40 * min(1.0, liquidity / max(config.minimum_liquidity * 5, 1))))
+    spread_score = 20 if spread is None else max(0, int(20 * (1 - min(1.0, spread / max(config.max_spread, 0.0001)))))
+    price_score = int(round(float(state.get("fomo_capacity") or 0)))
+    tradability_score = max(0, min(100, liquidity_score + spread_score + price_score))
+    if status == "blocked":
+        tradability_score = min(tradability_score, 40)
+    elif status == "research_only":
+        tradability_score = min(tradability_score, 60)
+
+    return {
+        "status": status,
+        "tradability_score": tradability_score,
+        "cost_first_failure": cost_first_failure,
+        "spread": spread,
+        "max_spread": config.max_spread,
+        "liquidity": liquidity,
+        "minimum_liquidity": config.minimum_liquidity,
+    }
+
+
+def _participant_lens(
+    state: Mapping[str, object],
+    risk_tags: Sequence[str],
+    direction: str,
+    config: FomoModelConfig,
+) -> dict:
+    tags = set(risk_tags)
+    liquidity = _coerce_float(state.get("liquidity"))
+    spread = _coerce_float(state.get("spread"))
+    executable = "not_executable" not in tags and "no_market_price" not in tags
+    directional = direction != "watch_only"
+    clean_timing = "already_priced_in" not in tags and "confirmed_news" not in tags
+    retail = "candidate" if executable and directional and clean_timing and "near_deadline_rejected" not in tags else "blocked"
+    institution = (
+        "candidate"
+        if retail == "candidate" and liquidity is not None and liquidity >= config.minimum_liquidity * 5
+        else "capacity_limited" if retail == "candidate" else "blocked"
+    )
+    market_maker = "microstructure_context"
+    if spread is not None and spread > config.max_spread:
+        market_maker = "spread_context_only"
+    elif not directional:
+        market_maker = "watch_only_flow_context"
+    return {
+        "retail": retail,
+        "institution": institution,
+        "market_maker": market_maker,
+        "notes": "participant fit is model-derived from liquidity, spread, direction, timing, and confirmation risk",
+    }
+
+
+def _data_provenance(
+    state: Mapping[str, object],
+    wallet_flows: Sequence[Mapping[str, object]],
+    confirmation_items: Sequence[Tuple[object, Mapping[str, object]]],
+) -> dict:
+    return {
+        "market_price": "observed" if state.get("mid") is not None else "missing",
+        "spread": "observed" if state.get("spread") is not None else "missing",
+        "liquidity": "observed_or_market_metadata" if state.get("liquidity") is not None else "missing",
+        "narrative_direction": "model_derived_keyword_rules",
+        "source_quality": "configured_prior",
+        "wallet_activity": "observed_public_wallet_activity" if wallet_flows else "missing",
+        "wallet_intent": "inferred_not_claimed" if wallet_flows else "not_evaluated",
+        "confirmation_status": "observed_source_category" if confirmation_items else "inferred_unconfirmed",
+        "edge_classification": "model_derived",
+    }
 
 
 def _direction(items: Sequence[Tuple[object, Mapping[str, object]]], config: FomoModelConfig) -> Tuple[str, Dict[str, int]]:

@@ -72,6 +72,9 @@ def _signal_detail(row: dict) -> List[str]:
     wallet_flows = _loads(row["wallet_flows"], [])
     price_window = _loads(row["price_window"], {})
     post = source_posts[0] if source_posts else {}
+    tradability = evidence.get("tradability") if isinstance(evidence.get("tradability"), dict) else {}
+    participant_lens = evidence.get("participant_lens") if isinstance(evidence.get("participant_lens"), dict) else {}
+    data_provenance = evidence.get("data_provenance") if isinstance(evidence.get("data_provenance"), dict) else {}
     lines = [
         f"### {row['market_slug']}",
         "",
@@ -87,6 +90,12 @@ def _signal_detail(row: dict) -> List[str]:
         f"wallet={evidence.get('early_wallet_confirmation_score')}, penalty={evidence.get('anti_front_run_penalty')}",
         f"- Market moves: 1h={price_window.get('market_move_1h')}, 6h={price_window.get('market_move_6h')}, "
         f"24h={price_window.get('market_move_24h')}, spread={price_window.get('spread')}, liquidity={price_window.get('liquidity')}",
+        f"- Edge review: class={evidence.get('edge_classification')}, tradability={tradability.get('status')}, "
+        f"first_failure={tradability.get('cost_first_failure')}",
+        f"- Participant lens: retail={participant_lens.get('retail')}, institution={participant_lens.get('institution')}, "
+        f"market_maker={participant_lens.get('market_maker')}",
+        f"- Provenance: price={data_provenance.get('market_price')}, direction={data_provenance.get('narrative_direction')}, "
+        f"wallet={data_provenance.get('wallet_activity')}",
     ]
     if wallet_flows:
         lines.append("- Wallet flows:")

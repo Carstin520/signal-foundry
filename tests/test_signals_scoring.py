@@ -45,6 +45,13 @@ def test_fomo_divergence_signal_for_long_deadline_nomination_market(tmp_path) ->
     assert signal.score >= 75
     assert signal.direction_hint == "yes_up"
     assert signal.price_window["fomo_capacity"] == 20
+    assert signal.evidence["edge_classification"] == "narrative_fomo_edge"
+    assert signal.evidence["tradability"]["status"] == "tradable_candidate"
+    assert signal.evidence["tradability"]["cost_first_failure"] == "none"
+    assert signal.evidence["participant_lens"]["retail"] == "candidate"
+    assert signal.evidence["participant_lens"]["institution"] == "candidate"
+    assert signal.evidence["data_provenance"]["market_price"] == "observed"
+    assert signal.evidence["data_provenance"]["narrative_direction"] == "model_derived_keyword_rules"
     assert "already_priced_in" not in signal.risk_tags
     assert should_alert(signal)
 
@@ -120,7 +127,12 @@ def test_low_liquidity_single_handle_pump_does_not_alert(tmp_path) -> None:
     signal = score_recent(con, "2026-05-15T00:00:00+00:00", HANDLES, load_market_rules(), load_fomo_config())[0]
 
     assert "not_executable" in signal.risk_tags
+    assert "thin_liquidity" in signal.risk_tags
     assert "low_liquidity_pump" in signal.risk_tags
+    assert signal.evidence["edge_classification"] == "liquidity_constrained_narrative"
+    assert signal.evidence["tradability"]["status"] == "blocked"
+    assert signal.evidence["tradability"]["cost_first_failure"] == "liquidity"
+    assert signal.evidence["participant_lens"]["retail"] == "blocked"
     assert not should_alert(signal)
 
 
