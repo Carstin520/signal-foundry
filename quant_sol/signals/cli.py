@@ -40,6 +40,7 @@ from .diagnostics import model_diagnostics, write_model_diagnostics
 from .discovery import (
     discover_signal_source_candidates,
     planned_x_calls_for_discovery,
+    write_latest_polymarket_targets,
     write_signal_discovery_report,
 )
 from .history import (
@@ -128,6 +129,9 @@ def discover_signal_sources(
     daily_cap: Optional[int] = typer.Option(None, "--daily-cap", help="Local daily X API call cap."),
     include_reddit: bool = typer.Option(True, "--include-reddit/--no-reddit", help="Use public Reddit search as low-confidence context."),
     reddit_limit: int = typer.Option(5, "--reddit-limit", help="Maximum Reddit context posts per market."),
+    include_public_seeds: bool = typer.Option(True, "--include-public-seeds/--no-public-seeds", help="Map public preflight X/Reddit/Discord seed sources before X API search."),
+    source_seed_path: Optional[Path] = typer.Option(None, "--source-seed-path", help="Optional public seed config path for discovery V2."),
+    latest_targets_path: Optional[Path] = typer.Option(None, "--latest-targets-path", help="Overwrite a concise latest-targets markdown file."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Plan market and X API usage without external X/reddit searches."),
 ) -> None:
     """Find high-interest open Polymarket pools and candidate X accounts to add as signal sources."""
@@ -151,6 +155,8 @@ def discover_signal_sources(
         max_posts_per_market=max_posts_per_market,
         include_reddit=include_reddit and not dry_run,
         reddit_limit=reddit_limit,
+        include_public_seeds=include_public_seeds,
+        source_seed_path=source_seed_path,
         dry_run=dry_run,
     )
     _render_signal_discovery(result)
@@ -161,6 +167,9 @@ def discover_signal_sources(
         record_api_call(con, "x", "tweets/search/recent", call_count=int(result.get("planned_x_calls") or 0), notes="discover-signal-sources")
     path = write_signal_discovery_report(result, SIGNAL_REPORT_ROOT)
     console.print(f"Wrote signal discovery report: {path}")
+    if latest_targets_path:
+        latest_path = write_latest_polymarket_targets(result, latest_targets_path)
+        console.print(f"Wrote latest Polymarket targets: {latest_path}")
 
 
 @app.command("sync-social")
@@ -1458,6 +1467,28 @@ def _render_signal_discovery(result: dict) -> None:
         )
     console.print(market_table)
 
+    seed_table = Table(title="Public Seed Preflight")
+    seed_table.add_column("Rank", justify="right")
+    seed_table.add_column("Platform")
+    seed_table.add_column("Source")
+    seed_table.add_column("Market")
+    seed_table.add_column("Score", justify="right")
+    seed_table.add_column("Status")
+    seed_table.add_column("Risk")
+    for idx, row in enumerate((result.get("public_seed_candidates") or [])[:30], start=1):
+        handle = str(row.get("handle") or "")
+        label = f"@{handle}" if row.get("platform") == "x" else handle
+        seed_table.add_row(
+            str(idx),
+            str(row.get("platform") or ""),
+            label,
+            str(row.get("market_slug") or ""),
+            _fmt(row.get("discovery_score")),
+            str(row.get("recommended_status") or ""),
+            ", ".join((row.get("risk_tags") or [])[:3]),
+        )
+    console.print(seed_table)
+
     source_table = Table(title="Discovered Signal Source Candidates")
     source_table.add_column("Rank", justify="right")
     source_table.add_column("Handle")
@@ -1466,7 +1497,10 @@ def _render_signal_discovery(result: dict) -> None:
     source_table.add_column("Posts", justify="right")
     source_table.add_column("Engagement", justify="right")
     source_table.add_column("Status")
+    source_table.add_column("Edge")
+    source_table.add_column("Tradability")
     for idx, row in enumerate((result.get("source_candidates") or [])[:30], start=1):
+        tradability = row.get("tradability") if isinstance(row.get("tradability"), dict) else {}
         source_table.add_row(
             str(idx),
             f"@{row.get('handle')}",
@@ -1475,6 +1509,8 @@ def _render_signal_discovery(result: dict) -> None:
             str(row.get("post_count") or 0),
             _fmt(row.get("engagement_score")),
             str(row.get("recommended_status") or ""),
+            str(row.get("edge_classification") or ""),
+            str(tradability.get("status") or ""),
         )
     console.print(source_table)
 

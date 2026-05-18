@@ -2,9 +2,14 @@ from datetime import datetime, timedelta, timezone
 
 from quant_sol.signals.discovery import (
     discover_interesting_markets,
+    discover_signal_source_candidates,
     market_interest_score,
     market_query_terms,
+    platform_watch_candidates_for_markets,
+    public_seed_candidates_for_markets,
     rank_discovered_sources,
+    write_latest_polymarket_targets,
+    write_signal_discovery_report,
     x_query_for_market,
 )
 from quant_sol.signals.models import MarketRecord
@@ -99,6 +104,272 @@ def test_signal_discovery_sources_are_stored(tmp_path) -> None:
 
     assert count == 1
     assert con.execute("select handle, discovery_score from signal_discovery_sources").fetchone() == ("FastReporter", 42.0)
+
+
+def test_public_seed_preflight_marks_account_dependency_and_required_checks() -> None:
+    market = MarketRecord(
+        market_slug="will-elon-musk-post-about-doge-by-june-30",
+        event_slug="elon-musk-doge",
+        question="Will Elon Musk post about Doge by June 30?",
+        category="Crypto",
+        tags=["Musk", "Doge"],
+        end_time=None,
+        resolution_source=None,
+        clob_token_ids=["yes-token"],
+        liquidity=500_000,
+        raw={},
+    )
+
+    rows = public_seed_candidates_for_markets(
+        [
+            {
+                "record": market,
+                "score": 75,
+                "liquidity": 500_000,
+                "volume": 2_000_000,
+                "deadline_days": 30,
+                "query_terms": ["elon", "musk", "doge"],
+            }
+        ],
+        seed_config={
+            "seeds": [
+                {
+                    "platform": "x",
+                    "handle": "elonmusk",
+                    "role": "account_dependency",
+                    "priority": "core",
+                    "themes": ["elon", "musk", "doge"],
+                    "risk_tags": ["account_dependency"],
+                }
+            ]
+        },
+    )
+
+    assert rows[0]["handle"] == "elonmusk"
+    assert rows[0]["recommended_status"] == "public_seed_preflight"
+    assert rows[0]["edge_classification"] == "narrative_fomo_edge"
+    assert rows[0]["data_provenance"]["price_impact"] == "not_evaluated_in_preflight"
+    assert rows[0]["tradability"]["status"] == "needs_live_validation"
+    assert "account_dependency" in rows[0]["risk_tags"]
+    assert "pre/post market ticks" in rows[0]["required_data"]
+
+
+def test_platform_watch_keeps_reddit_low_confidence_and_discord_manual() -> None:
+    market = MarketRecord(
+        market_slug="iran-israel-ceasefire-by-june-30",
+        event_slug="iran-israel-ceasefire",
+        question="Iran Israel ceasefire by June 30?",
+        category="Geopolitics",
+        tags=["Iran", "Israel"],
+        end_time=None,
+        resolution_source=None,
+        clob_token_ids=["yes-token"],
+        liquidity=500_000,
+        raw={},
+    )
+
+    rows = platform_watch_candidates_for_markets(
+        [{"record": market, "score": 80, "query_terms": ["iran", "israel"], "liquidity": 500_000, "deadline_days": 30}],
+        seed_config={
+            "platform_watch": {
+                "reddit": [{"name": "r/geopolitics", "themes": ["iran"], "risk_tags": ["low_confidence_context"]}],
+                "discord": [{"name": "Faytuks News", "themes": ["iran"], "risk_tags": ["manual_public_watch"]}],
+            }
+        },
+    )
+
+    by_platform = {row["platform"]: row for row in rows}
+    assert by_platform["reddit"]["recommended_status"] == "low_confidence_context"
+    assert by_platform["discord"]["recommended_status"] == "manual_public_watch"
+    assert by_platform["discord"]["data_provenance"]["platform_context"] == "inferred_authorized_channel_only"
+    assert "no_private_scraping" in by_platform["discord"]["risk_tags"]
+
+
+def test_discovery_dry_run_returns_public_seeds_before_x_or_reddit(monkeypatch, tmp_path) -> None:
+    now = datetime(2026, 5, 16, tzinfo=timezone.utc)
+    rows = [
+        {
+            "slug": "will-elon-musk-post-about-doge-by-june-30",
+            "question": "Will Elon Musk post about Doge by June 30?",
+            "category": "Crypto",
+            "endDate": (now + timedelta(days=30)).isoformat(),
+            "liquidity": 500_000,
+            "volume": 2_000_000,
+            "clobTokenIds": ["yes-token"],
+            "active": True,
+            "closed": False,
+        }
+    ]
+
+    class FakeGamma:
+        def list_markets(self, max_pages=2):
+            return rows
+
+    seed_path = tmp_path / "seeds.yaml"
+    seed_path.write_text(
+        """
+seeds:
+  - platform: x
+    handle: elonmusk
+    role: account_dependency
+    priority: core
+    themes: [elon, musk, doge]
+platform_watch:
+  reddit:
+    - name: r/CryptoCurrency
+      themes: [doge, crypto]
+  discord:
+    - name: Public crypto watch
+      themes: [doge]
+references:
+  - label: example
+    url: https://example.com
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("quant_sol.signals.discovery.GammaMarketClient", lambda: FakeGamma())
+
+    result = discover_signal_source_candidates(connect(tmp_path / "dry.duckdb"), dry_run=True, source_seed_path=seed_path)
+
+    assert result["x_posts"] == []
+    assert result["reddit_posts"] == []
+    assert result["planned_x_calls"] == 1
+    assert result["public_seed_candidates"][0]["handle"] == "elonmusk"
+    assert result["platform_watch"]
+    assert result["source_references"][0]["label"] == "example"
+
+
+def test_signal_discovery_report_includes_preflight_platforms_and_model_review(tmp_path) -> None:
+    market = MarketRecord(
+        market_slug="us-iran-peace",
+        event_slug="us-iran-peace",
+        question="US Iran peace deal?",
+        category="Geopolitics",
+        tags=["Iran"],
+        end_time=None,
+        resolution_source=None,
+        clob_token_ids=["yes-token"],
+        liquidity=1_000_000,
+        raw={},
+    )
+    path = write_signal_discovery_report(
+        {
+            "markets": [{"record": market, "score": 80, "liquidity": 1_000_000, "volume": 5_000_000, "deadline_days": 30, "query_terms": ["iran"]}],
+            "x_posts": [],
+            "reddit_posts": [],
+            "source_candidates": [],
+            "public_seed_candidates": [
+                {
+                    "platform": "x",
+                    "handle": "Faytuks",
+                    "market_slug": "us-iran-peace",
+                    "discovery_score": 65,
+                    "recommended_status": "public_seed_preflight",
+                    "edge_classification": "narrative_fomo_edge",
+                    "risk_tags": ["social_only_preflight"],
+                }
+            ],
+            "platform_watch": [
+                {
+                    "platform": "discord",
+                    "handle": "Faytuks News",
+                    "market_slug": "us-iran-peace",
+                    "discovery_score": 30,
+                    "recommended_status": "manual_public_watch",
+                    "risk_tags": ["no_private_scraping"],
+                }
+            ],
+            "source_references": [{"label": "Polymarket API docs", "url": "https://docs.polymarket.com/api-reference/introduction"}],
+        },
+        tmp_path,
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert "## Public Seed Preflight" in text
+    assert "## Reddit And Discord Watch" in text
+    assert "## Model Review Discipline" in text
+    assert "no_private_scraping" in text
+    assert "Polymarket API docs" in text
+
+
+def test_latest_polymarket_targets_file_is_overwritten(tmp_path) -> None:
+    path = tmp_path / "latest.md"
+    path.write_text("old content", encoding="utf-8")
+    markets = [
+        {
+            "record": MarketRecord(
+                market_slug="us-iran-peace",
+                event_slug="us-iran-peace",
+                question="US Iran peace deal?",
+                category="Geopolitics",
+                tags=["Iran"],
+                end_time=None,
+                resolution_source=None,
+                clob_token_ids=["yes-token"],
+                liquidity=1_000_000,
+                raw={},
+            ),
+            "score": 80,
+            "liquidity": 1_000_000,
+            "volume": 5_000_000,
+            "deadline_days": 30,
+            "query_terms": ["iran", "peace", "deal"],
+        }
+    ]
+
+    write_latest_polymarket_targets(
+        {
+            "markets": markets,
+            "x_posts": [{"post_id": "p1"}],
+            "reddit_posts": [],
+            "source_candidates": [
+                {
+                    "handle": "FastReporter",
+                    "market_slug": "us-iran-peace",
+                    "discovery_score": 70,
+                }
+            ],
+        },
+        path,
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert "old content" not in text
+    assert "`us-iran-peace`" in text
+    assert "@FastReporter" in text
+
+
+def test_latest_polymarket_targets_classifies_warnock_as_us_politics(tmp_path) -> None:
+    path = tmp_path / "latest.md"
+    write_latest_polymarket_targets(
+        {
+            "markets": [
+                {
+                    "record": MarketRecord(
+                        market_slug="will-raphael-warnock-win-the-2028-democratic-presidential-nomination",
+                        event_slug="democratic-presidential-nomination",
+                        question="Will Raphael Warnock win the 2028 Democratic presidential nomination?",
+                        category="unknown",
+                        tags=[],
+                        end_time=None,
+                        resolution_source=None,
+                        clob_token_ids=["yes-token"],
+                        liquidity=1_000_000,
+                        raw={},
+                    ),
+                    "score": 70,
+                    "liquidity": 1_000_000,
+                    "volume": 2_000_000,
+                    "deadline_days": 900,
+                    "query_terms": ["democratic", "nomination", "presidential", "raphael", "warnock"],
+                }
+            ],
+            "source_candidates": [],
+        },
+        path,
+    )
+
+    assert "| 1 | us_politics |" in path.read_text(encoding="utf-8")
 
 
 def test_narrative_focus_filters_sports_markets(monkeypatch) -> None:

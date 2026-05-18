@@ -1,0 +1,259 @@
+references:
+  - label: Polymarket API docs
+    url: https://docs.polymarket.com/api-reference/introduction
+  - label: Polymarket geopolitics page
+    url: https://polymarket.com/geopolitics
+  - label: MojoMeters
+    url: https://www.mojometers.live/
+  - label: MKTracker
+    url: https://mktracker.info/
+  - label: ProfileTracer X alerts
+    url: https://www.profiletracer.com/x-alerts/
+  - label: Faytuks Discord listing
+    url: https://discord.com/servers/1108138416660557926
+  - label: r/polymarketAnalysis example
+    url: https://www.reddit.com/r/polymarketAnalysis/comments/1tcyud0/here_are_the_5_highestquality_polymarket_trades/
+  - label: OpenIntel
+    url: https://openintel.world/
+
+platform_defaults:
+  x:
+    provenance: observed_public_profile_seed
+    confidence: preflight
+  reddit:
+    provenance: observed_public_forum_context
+    confidence: low
+  discord:
+    provenance: inferred_public_or_authorized_channel
+    confidence: manual_watch
+
+seeds:
+  - platform: x
+    handle: elonmusk
+    role: account_dependency
+    priority: core
+    themes: [musk, elon, tesla, x, twitter, spacex, doge, crypto, trump, regulation]
+    risk_tags: [account_dependency, single_source_narrative, social_only_preflight]
+    notes: Account posts can directly define or move some markets; verify price moved after the post, not before it.
+  - platform: x
+    handle: cz_binance
+    role: account_dependency
+    priority: core
+    themes: [binance, cz, crypto, bitcoin, bnb, sec, regulation]
+    risk_tags: [account_dependency, crypto_policy_dependency, social_only_preflight]
+    notes: Crypto-policy and exchange narratives can reprice quickly; confirm liquidity and whether the market already moved.
+  - platform: x
+    handle: zachxbt
+    role: high_signal_investigator
+    priority: core
+    themes: [crypto, hack, exploit, wallet, exchange, scam, onchain]
+    risk_tags: [single_source_narrative, social_only_preflight]
+    notes: Useful for crypto incident discovery, but evidence often needs independent confirmation and market mapping.
+  - platform: x
+    handle: WhiteHouse
+    role: confirmation_source
+    priority: core
+    themes: [trump, biden, tariff, sanction, iran, china, ukraine, policy, fed]
+    risk_tags: [official_confirmation, late_after_price_move]
+    notes: Treat as confirmation/exclusion source, not alpha source.
+  - platform: x
+    handle: khamenei_ir
+    role: official_source
+    priority: watch
+    themes: [iran, israel, us, war, nuclear, sanctions, regime]
+    risk_tags: [official_confirmation, account_dependency]
+    notes: Public official signal for Iran narratives; settlement relevance depends on market rules.
+  - platform: x
+    handle: ZelenskyyUa
+    role: official_source
+    priority: watch
+    themes: [ukraine, russia, war, nato, ceasefire, sanctions]
+    risk_tags: [official_confirmation, account_dependency]
+    notes: Confirmation source for Ukraine/Russia markets; often late relative to OSINT.
+  - platform: x
+    handle: tesla
+    role: account_dependency
+    priority: watch
+    themes: [tesla, musk, vehicle, robotaxi, earnings, elon]
+    risk_tags: [account_dependency, official_confirmation]
+    notes: Company-account dependency for Tesla-specific markets.
+  - platform: x
+    handle: nvidia
+    role: account_dependency
+    priority: watch
+    themes: [nvidia, ai, chips, export, china, earnings, semiconductor]
+    risk_tags: [account_dependency, official_confirmation]
+    notes: Company-account dependency for AI/chip policy and earnings narratives.
+  - platform: x
+    handle: sentdefender
+    role: osint_geopolitics
+    priority: core
+    themes: [iran, israel, syria, china, taiwan, war, strike, missile, ceasefire, military]
+    risk_tags: [fast_but_noisy, social_only_preflight]
+    notes: Fast OSINT/geopolitics curator; requires repeated post-to-price validation.
+  - platform: x
+    handle: Faytuks
+    role: osint_geopolitics
+    priority: core
+    themes: [iran, israel, syria, russia, ukraine, war, ceasefire, missile, breaking]
+    risk_tags: [fast_but_noisy, social_only_preflight]
+    notes: High-frequency geopolitical news account; cross-check against market movement and upstream source.
+  - platform: x
+    handle: ELINTNews
+    role: osint_geopolitics
+    priority: core
+    themes: [iran, israel, syria, taiwan, china, military, war, missile, strike]
+    risk_tags: [fast_but_noisy, social_only_preflight]
+    notes: Military/geopolitics OSINT candidate.
+  - platform: x
+    handle: Liveuamap
+    role: osint_geopolitics
+    priority: watch
+    themes: [ukraine, russia, israel, iran, syria, war, strike, map]
+    risk_tags: [aggregator, social_only_preflight]
+    notes: Map/news aggregator; useful for context and cascade timing.
+  - platform: x
+    handle: Global_Mil_Info
+    role: osint_geopolitics
+    priority: watch
+    themes: [military, war, missile, strike, iran, israel, china, taiwan]
+    risk_tags: [fast_but_noisy, social_only_preflight]
+    notes: Military update candidate.
+  - platform: x
+    handle: Osinttechnical
+    role: osint_geopolitics
+    priority: watch
+    themes: [military, ukraine, russia, drones, missile, strike, war]
+    risk_tags: [specialized_context, social_only_preflight]
+    notes: Specialized military/OSINT source; strongest for Ukraine/Russia and equipment narratives.
+  - platform: x
+    handle: RALee85
+    role: regional_expert
+    priority: watch
+    themes: [russia, ukraine, war, military, defense, nato]
+    risk_tags: [specialized_context, slower_but_higher_quality]
+    notes: Expert-source candidate; may be slower but cleaner than headline curators.
+  - platform: x
+    handle: Aviation_Intel
+    role: regional_expert
+    priority: watch
+    themes: [aviation, military, strike, missile, israel, iran, china, taiwan]
+    risk_tags: [specialized_context, social_only_preflight]
+    notes: Aviation/military context for escalation markets.
+  - platform: x
+    handle: BNONews
+    role: fast_curator
+    priority: core
+    themes: [breaking, war, election, disaster, attack, ceasefire, death, politics]
+    risk_tags: [aggregator, social_only_preflight]
+    notes: Broad fast-news candidate; useful for discovery but not always original.
+  - platform: x
+    handle: FirstSquawk
+    role: macro_squawk
+    priority: core
+    themes: [fed, cpi, inflation, rates, tariff, oil, stocks, bitcoin, sec, crypto]
+    risk_tags: [fast_but_noisy, headline_only]
+    notes: Market-squawk candidate; verify headline source and price timing.
+  - platform: x
+    handle: zerohedge
+    role: macro_squawk
+    priority: watch
+    themes: [fed, cpi, inflation, tariff, oil, stocks, recession, bitcoin]
+    risk_tags: [fast_but_noisy, social_only_preflight]
+    notes: Broad macro/news amplifier; source-chain analysis is required.
+  - platform: x
+    handle: KobeissiLetter
+    role: macro_commentary
+    priority: watch
+    themes: [fed, cpi, inflation, rates, stocks, recession, macro]
+    risk_tags: [commentary_after_move, social_only_preflight]
+    notes: Useful for macro context; may be later than raw squawk accounts.
+  - platform: x
+    handle: WatcherGuru
+    role: crypto_squawk
+    priority: watch
+    themes: [bitcoin, crypto, ethereum, solana, sec, etf, binance, coinbase]
+    risk_tags: [fast_but_noisy, social_only_preflight]
+    notes: Crypto headline candidate; needs strict false-FOMO penalty.
+  - platform: x
+    handle: CoinDesk
+    role: crypto_reporter
+    priority: watch
+    themes: [bitcoin, crypto, ethereum, solana, sec, etf, regulation, coinbase]
+    risk_tags: [publisher_latency, official_article_after_social]
+    notes: Higher-quality crypto publisher; often confirmation/context rather than earliest source.
+  - platform: x
+    handle: Cointelegraph
+    role: crypto_reporter
+    priority: watch
+    themes: [bitcoin, crypto, ethereum, solana, sec, etf, regulation]
+    risk_tags: [publisher_latency, social_only_preflight]
+    notes: Crypto publisher and amplifier candidate.
+  - platform: x
+    handle: AP
+    role: confirmation_source
+    priority: watch
+    themes: [election, war, politics, court, fed, trump, tariff]
+    risk_tags: [confirmation_source, late_after_price_move]
+    notes: High-quality confirmation source, not usually alpha for micro windows.
+  - platform: x
+    handle: FT
+    role: institutional_news
+    priority: watch
+    themes: [tariff, china, fed, economy, oil, sanctions, regulation]
+    risk_tags: [publisher_latency, paywall_context]
+    notes: Institutional-quality context; timing must be measured against market move.
+  - platform: x
+    handle: CNBC
+    role: market_news
+    priority: watch
+    themes: [fed, stocks, trump, tariff, china, bitcoin, election]
+    risk_tags: [publisher_latency, social_only_preflight]
+    notes: Broad market-news candidate; watch for amplification rather than origination.
+  - platform: x
+    handle: unusual_whales
+    role: market_translator
+    priority: watch
+    themes: [stocks, options, fed, cpi, tariff, politics, bitcoin]
+    risk_tags: [market_translator, social_only_preflight]
+    notes: Market-translator candidate; evaluate as cascade/amplifier unless early.
+
+platform_watch:
+  reddit:
+    - name: r/Polymarket
+      themes: [polymarket, prediction, markets, trades]
+      risk_tags: [low_confidence_context, retail_discussion]
+    - name: r/polymarketAnalysis
+      themes: [polymarket, prediction, trades, analysis]
+      risk_tags: [low_confidence_context, retail_discussion]
+    - name: r/PredictionMarkets
+      themes: [prediction, markets, polymarket, kalshi]
+      risk_tags: [low_confidence_context, cross_venue_context]
+    - name: r/geopolitics
+      themes: [iran, israel, china, taiwan, ukraine, russia, sanctions]
+      risk_tags: [low_confidence_context, broad_discussion]
+    - name: r/worldnews
+      themes: [breaking, iran, israel, china, taiwan, ukraine, russia]
+      risk_tags: [low_confidence_context, broad_discussion]
+    - name: r/OSINT
+      themes: [osint, conflict, war, geolocation, breaking]
+      risk_tags: [low_confidence_context, source_discovery]
+    - name: r/osinttools
+      themes: [osint, tools, source, monitoring]
+      risk_tags: [low_confidence_context, source_discovery]
+    - name: r/CryptoCurrency
+      themes: [crypto, bitcoin, ethereum, sec, etf, binance]
+      risk_tags: [low_confidence_context, retail_discussion]
+  discord:
+    - name: Faytuks News
+      access: public_or_authorized_only
+      themes: [breaking, osint, iran, israel, ukraine, russia, war]
+      risk_tags: [manual_public_watch, no_private_scraping]
+    - name: Polymarket official/community
+      access: public_or_authorized_only
+      themes: [polymarket, prediction, markets, trades]
+      risk_tags: [manual_public_watch, no_private_scraping]
+    - name: Prediction market tooling communities
+      access: public_or_authorized_only
+      themes: [prediction, markets, analytics, tooling]
+      risk_tags: [manual_public_watch, no_private_scraping]
