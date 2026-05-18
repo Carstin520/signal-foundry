@@ -12,7 +12,7 @@ import duckdb
 import requests
 import yaml
 
-from .clients import GammaMarketClient, XApiClient, market_record_from_gamma
+from .clients import GammaMarketClient, KalshiMarketClient, XApiClient, market_record_from_gamma
 from .models import MarketRecord
 from .storage import save_raw_payload, upsert_markets, upsert_signal_discovery_sources, upsert_x_posts
 from .utils import first_float, stable_hash, to_datetime, utc_now_iso, words
@@ -97,6 +97,7 @@ EDGE_CLASSIFICATION = "narrative_fomo_edge"
 PREFLIGHT_STATUS = "public_seed_preflight"
 REDDIT_CONTEXT_STATUS = "low_confidence_context"
 DISCORD_WATCH_STATUS = "manual_public_watch"
+KALSHI_CONTEXT_STATUS = "cross_venue_context"
 
 
 def discover_signal_source_candidates(
@@ -112,6 +113,9 @@ def discover_signal_source_candidates(
     include_reddit: bool = True,
     reddit_limit: int = 5,
     include_public_seeds: bool = True,
+    include_kalshi: bool = True,
+    kalshi_limit: int = 10,
+    kalshi_max_pages: int = 2,
     source_seed_path: Optional[Path] = None,
     dry_run: bool = False,
 ) -> dict:
@@ -126,6 +130,8 @@ def discover_signal_source_candidates(
         public_seed_candidates_for_markets(markets, seed_config=seed_config) if include_public_seeds else []
     )
     platform_watch = platform_watch_candidates_for_markets(markets, seed_config=seed_config) if include_public_seeds else []
+    kalshi_hot_markets = discover_kalshi_hot_markets(max_markets=kalshi_limit, max_pages=kalshi_max_pages) if include_kalshi else []
+    kalshi_cross_venue = kalshi_cross_venue_candidates_for_markets(markets, kalshi_hot_markets)
     if dry_run:
         return {
             "markets": markets,
@@ -134,6 +140,8 @@ def discover_signal_source_candidates(
             "reddit_posts": [],
             "public_seed_candidates": public_seed_candidates,
             "platform_watch": platform_watch,
+            "kalshi_hot_markets": kalshi_hot_markets,
+            "kalshi_cross_venue": kalshi_cross_venue,
             "source_references": seed_config.get("references") or [],
             "planned_x_calls": len(markets),
         }
@@ -168,6 +176,8 @@ def discover_signal_source_candidates(
         "reddit_posts": reddit_posts,
         "public_seed_candidates": public_seed_candidates,
         "platform_watch": platform_watch,
+        "kalshi_hot_markets": kalshi_hot_markets,
+        "kalshi_cross_venue": kalshi_cross_venue,
         "source_references": seed_config.get("references") or [],
         "planned_x_calls": len(markets),
     }
@@ -234,6 +244,28 @@ def market_interest_score(record: MarketRecord, raw: Mapping[str, object], now: 
     return round(max(0.0, liquidity_score + volume_score + deadline_score + narrative_bonus), 3)
 
 
+def kalshi_market_heat_score(raw: Mapping[str, object]) -> float:
+    volume_24h = first_float(raw, "volume_24h_fp") or 0.0
+    volume = first_float(raw, "volume_fp") or 0.0
+    liquidity = first_float(raw, "liquidity_dollars") or 0.0
+    open_interest = first_float(raw, "open_interest_fp") or 0.0
+    spread = _kalshi_spread(raw)
+    terms = set(kalshi_query_terms(raw, max_terms=8))
+    narrative_bonus = min(18.0, len(terms & NARRATIVE_MARKERS) * 3.5)
+    sports_penalty = -8.0 if terms & {term for marker in SPORTS_MARKERS for term in marker.split()} else 0.0
+    spread_penalty = min(12.0, max(0.0, float(spread or 0) * 24.0))
+    score = (
+        min(36.0, math.log10(max(volume_24h, 1)) * 7.0)
+        + min(24.0, math.log10(max(volume, 1)) * 4.5)
+        + min(18.0, math.log10(max(liquidity, 1)) * 3.5)
+        + min(14.0, math.log10(max(open_interest, 1)) * 3.0)
+        + narrative_bonus
+        + sports_penalty
+        - spread_penalty
+    )
+    return round(max(0.0, score), 3)
+
+
 def _focus_allows_market(record: MarketRecord, focus: str) -> bool:
     normalized = focus.lower()
     haystack = " ".join([record.question, record.market_slug, record.event_slug or "", record.category or "", " ".join(record.tags)]).lower()
@@ -255,6 +287,38 @@ def market_query_terms(record: MarketRecord, max_terms: int = 5) -> list[str]:
     counts = Counter(term for term in words(haystack) if len(term) > 2 and not term.isdigit() and term not in DISCOVERY_STOPWORDS)
     prioritized = sorted(counts, key=lambda term: ((term not in NARRATIVE_MARKERS), -counts[term], term))
     return prioritized[:max_terms]
+
+
+def kalshi_query_terms(raw: Mapping[str, object], max_terms: int = 6) -> list[str]:
+    haystack = " ".join(
+        [
+            str(raw.get("title") or ""),
+            str(raw.get("subtitle") or ""),
+            str(raw.get("yes_sub_title") or ""),
+            str(raw.get("no_sub_title") or ""),
+            str(raw.get("event_ticker") or ""),
+            str(raw.get("ticker") or ""),
+        ]
+    )
+    counts = Counter(term for term in words(haystack) if len(term) > 2 and not term.isdigit() and term not in DISCOVERY_STOPWORDS)
+    prioritized = sorted(counts, key=lambda term: ((term not in NARRATIVE_MARKERS), -counts[term], term))
+    return prioritized[:max_terms]
+
+
+def _kalshi_category(raw: Mapping[str, object]) -> str:
+    return _target_category_from_text(
+        " ".join(
+            [
+                str(raw.get("title") or ""),
+                str(raw.get("subtitle") or ""),
+                str(raw.get("yes_sub_title") or ""),
+                str(raw.get("no_sub_title") or ""),
+                str(raw.get("event_ticker") or ""),
+                str(raw.get("ticker") or ""),
+                str(raw.get("category") or ""),
+            ]
+        )
+    )
 
 
 def x_query_for_market(record: MarketRecord) -> str:
@@ -332,6 +396,91 @@ def platform_watch_candidates_for_markets(
             matched_entries.sort(key=lambda row: row[0], reverse=True)
             for _, entry, overlap in matched_entries[:max_per_market]:
                 rows.append(_platform_watch_row(run_id, item, str(platform), entry, overlap))
+    return rows
+
+
+def discover_kalshi_hot_markets(
+    *,
+    max_markets: int = 10,
+    max_pages: int = 2,
+    client: Optional[KalshiMarketClient] = None,
+) -> list[dict]:
+    """Fetch public Kalshi markets and rank them as cross-venue discussion context."""
+    if max_markets <= 0:
+        return []
+    client = client or KalshiMarketClient()
+    try:
+        rows = client.list_markets(limit=1000, max_pages=max_pages, status="open", mve_filter="exclude")
+    except requests.RequestException:
+        return []
+    candidates = []
+    now = datetime.now(timezone.utc)
+    for raw in rows:
+        score = kalshi_market_heat_score(raw)
+        if score <= 0:
+            continue
+        close_time = to_datetime(str(raw.get("close_time") or raw.get("expiration_time") or ""))
+        deadline_days = max(0.0, (close_time - now).total_seconds() / 86400) if close_time else None
+        candidates.append(
+            {
+                "venue": "kalshi",
+                "ticker": raw.get("ticker") or "",
+                "event_ticker": raw.get("event_ticker") or "",
+                "title": raw.get("title") or raw.get("yes_sub_title") or "",
+                "category": _kalshi_category(raw),
+                "heat_score": score,
+                "volume_24h": first_float(raw, "volume_24h_fp") or 0.0,
+                "volume": first_float(raw, "volume_fp") or 0.0,
+                "liquidity": first_float(raw, "liquidity_dollars") or 0.0,
+                "open_interest": first_float(raw, "open_interest_fp") or 0.0,
+                "last_price": first_float(raw, "last_price_dollars"),
+                "yes_bid": first_float(raw, "yes_bid_dollars"),
+                "yes_ask": first_float(raw, "yes_ask_dollars"),
+                "spread": _kalshi_spread(raw),
+                "deadline_days": deadline_days,
+                "close_time": raw.get("close_time") or raw.get("expiration_time"),
+                "query_terms": kalshi_query_terms(raw),
+                "edge_classification": "cross_venue_context",
+                "data_provenance": {
+                    "source_activity": "observed_kalshi_public_market_api",
+                    "market_selection": "model_derived_public_heat_filter",
+                    "price_impact": "not_evaluated_against_polymarket",
+                    "platform_context": "observed_cross_venue_market_context",
+                },
+                "tradability": {
+                    "status": "context_only_until_rules_and_spread_match",
+                    "required_check": "compare Kalshi rules, close time, bid/ask, and volume against Polymarket equivalent",
+                },
+                "risk_tags": ["cross_venue_context", "venue_rule_mismatch", "no_order_execution"],
+                "raw": raw,
+            }
+        )
+    return sorted(candidates, key=lambda row: row["heat_score"], reverse=True)[:max_markets]
+
+
+def kalshi_cross_venue_candidates_for_markets(
+    markets: Sequence[Mapping[str, object]],
+    kalshi_hot_markets: Sequence[Mapping[str, object]],
+    *,
+    max_per_market: int = 5,
+) -> list[dict]:
+    rows: list[dict] = []
+    run_id = discovery_run_id()
+    for item in markets:
+        record = item["record"]
+        market_words = set(str(term).lower() for term in (item.get("query_terms") or market_query_terms(record))) | set(
+            words(_market_haystack(record))
+        )
+        matched = []
+        for kalshi in kalshi_hot_markets:
+            kalshi_terms = set(str(term).lower() for term in (kalshi.get("query_terms") or []))
+            overlap = sorted(market_words & kalshi_terms)
+            if not overlap:
+                continue
+            matched.append((len(overlap), float(kalshi.get("heat_score") or 0), kalshi, overlap))
+        matched.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        for _, _, kalshi, overlap in matched[:max_per_market]:
+            rows.append(_kalshi_cross_venue_row(run_id, item, kalshi, overlap))
     return rows
 
 
@@ -508,6 +657,60 @@ def _platform_watch_row(
     }
 
 
+def _kalshi_cross_venue_row(
+    run_id: str,
+    item: Mapping[str, object],
+    kalshi: Mapping[str, object],
+    overlap: Sequence[str],
+) -> dict:
+    record = item["record"]
+    risk_tags = ["cross_venue_context", "venue_rule_mismatch", "no_order_execution", "rules_must_be_compared"]
+    return {
+        "run_id": run_id,
+        "venue": "kalshi",
+        "platform": "kalshi",
+        "handle": str(kalshi.get("ticker") or ""),
+        "market_slug": record.market_slug,
+        "kalshi_ticker": kalshi.get("ticker") or "",
+        "kalshi_title": kalshi.get("title") or "",
+        "discovery_score": round(min(60.0, 18.0 + len(overlap) * 6.0 + float(kalshi.get("heat_score") or 0) * 0.12), 3),
+        "recommended_status": KALSHI_CONTEXT_STATUS,
+        "edge_classification": "cross_venue_context_until_post_to_price_validated",
+        "data_provenance": {
+            "source_activity": "observed_kalshi_public_market_api",
+            "market_selection": "model_derived_gamma_filter_plus_kalshi_heat_filter",
+            "price_impact": "not_evaluated_against_polymarket",
+            "platform_context": "observed_cross_venue_market_context",
+        },
+        "participant_lens": {
+            "retail": "context_only_rule_mismatch_risk",
+            "institution": "cross_venue_attention_and_capacity_context",
+            "market_maker": "watch_for_cross_venue_adverse_selection",
+        },
+        "tradability": {
+            "status": "not_tradable_without_rule_mapping_and_spread_check",
+            "cost_first_failure": "venue_rule_or_liquidity_mismatch",
+            "required_check": "map resolution rules, close time, bid/ask spread, liquidity, and already-moved flags across venues",
+        },
+        "risk_tags": risk_tags,
+        "required_data": [
+            "Kalshi market ticker/title/rules",
+            "Kalshi bid/ask, volume, open interest",
+            "Polymarket comparable market rules",
+            "Polymarket pre/post ticks and spread",
+        ],
+        "failure_mode": "a hot Kalshi pool can reflect a different contract, user base, fee model, or resolution source than the Polymarket pool",
+        "evidence": {
+            "source": "kalshi_public_market_api",
+            "matched_terms": list(overlap),
+            "kalshi_heat_score": kalshi.get("heat_score"),
+            "kalshi_volume_24h": kalshi.get("volume_24h"),
+            "kalshi_spread": kalshi.get("spread"),
+            "risk_tags": risk_tags,
+        },
+    }
+
+
 def _seed_preflight_score(item: Mapping[str, object], seed: Mapping[str, object], overlap: Sequence[str]) -> float:
     priority_bonus = {"core": 14.0, "watch": 7.0, "seed": 10.0}.get(str(seed.get("priority") or "watch"), 5.0)
     role_bonus = 8.0 if str(seed.get("role") or "") == "account_dependency" else 0.0
@@ -585,6 +788,8 @@ def write_signal_discovery_report(result: Mapping[str, object], report_root: Pat
     reddit_posts = list(result.get("reddit_posts") or [])
     public_seeds = list(result.get("public_seed_candidates") or [])
     platform_watch = list(result.get("platform_watch") or [])
+    kalshi_hot_markets = list(result.get("kalshi_hot_markets") or [])
+    kalshi_cross_venue = list(result.get("kalshi_cross_venue") or [])
     references = list(result.get("source_references") or [])
     lines = [
         "# Signal Source Discovery",
@@ -595,6 +800,8 @@ def write_signal_discovery_report(result: Mapping[str, object], report_root: Pat
         f"- Reddit context posts collected: {len(reddit_posts)}",
         f"- Public seed candidates: {len(public_seeds)}",
         f"- Platform watch candidates: {len(platform_watch)}",
+        f"- Kalshi hot markets: {len(kalshi_hot_markets)}",
+        f"- Kalshi cross-venue matches: {len(kalshi_cross_venue)}",
         f"- Source candidates: {len(sources)}",
         "",
         "## Market Candidates",
@@ -663,11 +870,46 @@ def write_signal_discovery_report(result: Mapping[str, object], report_root: Pat
     lines.extend(
         [
             "",
+            "## Kalshi Hot Pool Context",
+            "",
+            "| Rank | Ticker | Category | Heat | Volume 24h | Liquidity | Spread | Terms |",
+            "| ---: | --- | --- | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
+    if not kalshi_hot_markets:
+        lines.append("| n/a | n/a | n/a | 0 | 0 | 0 | n/a | n/a |")
+    for idx, row in enumerate(kalshi_hot_markets[:40], start=1):
+        lines.append(
+            f"| {idx} | `{row.get('ticker')}` | {row.get('category') or 'other'} | {_fmt(row.get('heat_score'))} | "
+            f"{_fmt(row.get('volume_24h'))} | {_fmt(row.get('liquidity'))} | {_fmt(row.get('spread'))} | "
+            f"{', '.join(row.get('query_terms') or [])} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Kalshi Cross-Venue Matches",
+            "",
+            "| Rank | Kalshi Ticker | Polymarket | Score | Status | Risk Tags |",
+            "| ---: | --- | --- | ---: | --- | --- |",
+        ]
+    )
+    if not kalshi_cross_venue:
+        lines.append("| n/a | n/a | n/a | 0 | no_cross_venue_match | n/a |")
+    for idx, row in enumerate(sorted(kalshi_cross_venue, key=lambda item: item.get("discovery_score") or 0, reverse=True)[:60], start=1):
+        lines.append(
+            f"| {idx} | `{row.get('kalshi_ticker') or row.get('handle')}` | `{row.get('market_slug')}` | "
+            f"{_fmt(row.get('discovery_score'))} | {row.get('recommended_status')} | "
+            f"{', '.join(row.get('risk_tags') or [])} |"
+        )
+    lines.extend(
+        [
+            "",
             "## Model Review Discipline",
             "",
             "- Edge classes separate narrative/FOMO, liquidity/latency, statistical, model-relative, and true no-arbitrage claims.",
             "- Public seeds are preflight hints. They do not become signal sources until repeated post-to-price evidence exists.",
             "- Reddit is low-confidence context; Discord is manual/public-or-authorized watch only unless explicit API access is provided.",
+            "- Kalshi hot pools are cross-venue context. They require rule, deadline, spread, and liquidity mapping before any Polymarket inference.",
             "- Every candidate still needs provenance, required data, failure mode, spread/liquidity, and already-moved checks.",
             "- Participant lens: retail needs simple capped-risk timing, institutions need repeatability/capacity, and market makers watch adverse selection.",
         ]
@@ -686,6 +928,7 @@ def write_signal_discovery_report(result: Mapping[str, object], report_root: Pat
             "- X searches are intentionally bounded by market count and posts per market.",
             "- Reddit is used as broad context/discussion discovery, not as a high-confidence signal source.",
             "- Discord channels are not scraped unless they are public or explicitly authorized.",
+            "- Kalshi hot pools are included as read-only cross-venue context, not as execution targets.",
             "- Candidates should be promoted to watchlists only after repeated post-to-price evidence.",
         ]
     )
@@ -787,6 +1030,219 @@ def _target_category(record: MarketRecord) -> str:
     if terms & {"fifa", "nba", "nfl", "mlb", "nhl", "ufc", "soccer", "football", "basketball", "baseball"} or "world cup" in haystack:
         return "sports"
     return (record.category or "other").lower().replace(" ", "_")
+
+
+def discover_kalshi_targets(
+    *,
+    max_markets: int = 12,
+    max_pages: int = 2,
+    min_volume: float = 100_000,
+    focus: str = "narrative",
+) -> dict:
+    rows = KalshiMarketClient().list_markets(max_pages=max_pages, status="open")
+    now = datetime.now(timezone.utc)
+    markets = []
+    for row in rows:
+        if not _focus_allows_text(_kalshi_text(row), focus):
+            continue
+        volume = _kalshi_float(row, "volume_24h", "volume_24h_fp", "volume", "volume_fp")
+        open_interest = _kalshi_float(row, "open_interest", "open_interest_fp")
+        if volume < min_volume and open_interest < min_volume:
+            continue
+        score = kalshi_interest_score(row, now)
+        if score <= 0:
+            continue
+        markets.append(
+            {
+                "record": row,
+                "score": score,
+                "volume": volume,
+                "open_interest": open_interest,
+                "spread": _kalshi_spread(row),
+                "deadline_days": _kalshi_deadline_days(row, now),
+                "query_terms": _kalshi_query_terms(row),
+                "category": _target_category_from_text(_kalshi_text(row)),
+            }
+        )
+    return {"markets": sorted(markets, key=lambda item: item["score"], reverse=True)[:max_markets]}
+
+
+def kalshi_interest_score(row: Mapping[str, object], now: Optional[datetime] = None) -> float:
+    now = now or datetime.now(timezone.utc)
+    volume = _kalshi_float(row, "volume_24h", "volume_24h_fp", "volume", "volume_fp")
+    open_interest = _kalshi_float(row, "open_interest", "open_interest_fp")
+    deadline_days = _kalshi_deadline_days(row, now)
+    spread = _kalshi_spread(row)
+    terms = set(_kalshi_query_terms(row))
+    narrative_bonus = min(20.0, len(terms & NARRATIVE_MARKERS) * 4)
+    volume_score = min(35.0, math.log10(max(volume, 1)) * 5)
+    interest_score = min(25.0, math.log10(max(open_interest, 1)) * 4)
+    spread_score = 8.0 if spread is None else max(0.0, 12.0 - spread * 100)
+    if deadline_days is None:
+        deadline_score = 8.0
+    elif deadline_days < 1:
+        deadline_score = -25.0
+    elif deadline_days < 3:
+        deadline_score = -8.0
+    elif deadline_days <= 180:
+        deadline_score = 15.0
+    else:
+        deadline_score = 8.0
+    return round(max(0.0, volume_score + interest_score + spread_score + deadline_score + narrative_bonus), 3)
+
+
+def write_latest_kalshi_targets(result: Mapping[str, object], path: Path, *, max_targets: int = 10) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    markets = _diversified_kalshi_markets(list(result.get("markets") or []), max_targets=max_targets)
+    lines = [
+        "# Latest Kalshi Targets",
+        "",
+        "This file is overwritten by the combined prediction-market discovery heartbeat every 2 hours.",
+        "",
+        f"- Last updated: {utc_now_iso()}",
+        f"- Markets scanned: {len(result.get('markets') or [])}",
+        "- Venue: Kalshi public market data",
+        "",
+        "## Selection Rules",
+        "",
+        "- Prefer open Kalshi markets with high volume or open interest.",
+        "- Keep category diversity across politics, geopolitics, macro, crypto, regulation, and other information-sensitive areas.",
+        "- Treat Kalshi candidates as cross-venue research targets; do not infer Polymarket equivalence without separate matching.",
+        "- Do not use trading APIs, private keys, or order endpoints.",
+        "",
+        "## Current Targets",
+        "",
+        "| Rank | Category | Ticker | Score | Volume | Open Interest | Spread | Deadline Days | Query Terms |",
+        "| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    if not markets:
+        lines.append("| n/a | n/a | n/a | 0 | 0 | 0 | n/a | n/a | n/a |")
+    for idx, item in enumerate(markets, start=1):
+        record = item["record"]
+        lines.append(
+            f"| {idx} | {item.get('category')} | `{record.get('ticker')}` | {_fmt(item.get('score'))} | "
+            f"{_fmt(item.get('volume'))} | {_fmt(item.get('open_interest'))} | {_fmt(item.get('spread'))} | "
+            f"{_fmt(item.get('deadline_days'))} | {', '.join(item.get('query_terms') or [])} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Run Notes",
+            "",
+            "- This list is for research monitoring only, not trading.",
+            "- Kalshi volume/open-interest fields are venue-specific and should not be compared one-for-one with Polymarket liquidity.",
+            "- Cross-venue matching, orderbook depth checks, and live micro capture are separate follow-up work.",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def _diversified_kalshi_markets(markets: Sequence[Mapping[str, object]], *, max_targets: int) -> list[Mapping[str, object]]:
+    selected = []
+    selected_categories = set()
+    for item in markets:
+        category = str(item.get("category") or "other").lower()
+        if category in selected_categories:
+            continue
+        selected.append(item)
+        selected_categories.add(category)
+        if len(selected) >= max_targets:
+            return selected
+    for item in markets:
+        ticker = str((item.get("record") or {}).get("ticker") or "")
+        if ticker in {str((row.get("record") or {}).get("ticker") or "") for row in selected}:
+            continue
+        selected.append(item)
+        if len(selected) >= max_targets:
+            break
+    return selected
+
+
+def _kalshi_text(row: Mapping[str, object]) -> str:
+    fields = [
+        row.get("ticker"),
+        row.get("event_ticker"),
+        row.get("series_ticker"),
+        row.get("title"),
+        row.get("subtitle"),
+        row.get("yes_sub_title"),
+        row.get("no_sub_title"),
+        row.get("category"),
+        row.get("settlement_sources"),
+    ]
+    return " ".join(str(item) for item in fields if item)
+
+
+def _focus_allows_text(text: str, focus: str) -> bool:
+    normalized = focus.lower()
+    haystack = text.lower()
+    terms = set(words(haystack))
+    is_sports = bool(terms & {"fifa", "nba", "nfl", "mlb", "nhl", "ufc", "soccer", "football", "basketball", "baseball"}) or "world cup" in haystack
+    has_narrative = bool(terms & NARRATIVE_MARKERS)
+    if normalized == "all":
+        return True
+    if normalized == "sports":
+        return is_sports
+    if normalized == "crypto":
+        return bool(terms & {"crypto", "bitcoin", "ethereum", "solana", "binance", "coinbase", "etf", "sec"})
+    if normalized in {"politics", "geopolitics"}:
+        return bool(terms & {"iran", "israel", "china", "taiwan", "trump", "election", "tariff", "sanction", "war", "ceasefire", "nuclear"})
+    return has_narrative and not is_sports
+
+
+def _kalshi_query_terms(row: Mapping[str, object], max_terms: int = 5) -> list[str]:
+    counts = Counter(
+        term
+        for term in words(_kalshi_text(row))
+        if len(term) > 2 and not term.isdigit() and term not in DISCOVERY_STOPWORDS and term not in {"kalshi", "ticker"}
+    )
+    prioritized = sorted(counts, key=lambda term: ((term not in NARRATIVE_MARKERS), -counts[term], term))
+    return prioritized[:max_terms]
+
+
+def _target_category_from_text(text: str) -> str:
+    haystack = text.lower()
+    terms = set(words(haystack))
+    if terms & {"bitcoin", "crypto", "ethereum", "solana", "binance", "coinbase", "etf"}:
+        return "crypto"
+    if terms & {"china", "taiwan", "iran", "israel", "war", "ceasefire", "nuclear", "sanction"}:
+        return "geopolitics"
+    if terms & {"trump", "president", "presidential", "democratic", "republican", "nomination", "election"}:
+        return "us_politics"
+    if terms & {"fed", "rate", "inflation", "tariff", "recession", "gdp", "cpi"}:
+        return "macro_policy"
+    if terms & {"fifa", "nba", "nfl", "mlb", "nhl", "ufc", "soccer", "football", "basketball", "baseball"} or "world cup" in haystack:
+        return "sports"
+    return "other"
+
+
+def _kalshi_float(row: Mapping[str, object], *names: str) -> float:
+    for name in names:
+        value = row.get(name)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _kalshi_spread(row: Mapping[str, object]) -> Optional[float]:
+    yes_bid = _kalshi_float(row, "yes_bid_dollars")
+    yes_ask = _kalshi_float(row, "yes_ask_dollars")
+    if yes_bid <= 0 or yes_ask <= 0 or yes_ask < yes_bid:
+        return None
+    return round(yes_ask - yes_bid, 4)
+
+
+def _kalshi_deadline_days(row: Mapping[str, object], now: datetime) -> Optional[float]:
+    raw = row.get("close_time") or row.get("latest_expiration_time")
+    dt = to_datetime(str(raw)) if raw else None
+    if dt is None:
+        return None
+    return round((dt - now).total_seconds() / 86400, 3)
 
 
 class RedditPublicClient:

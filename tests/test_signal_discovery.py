@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta, timezone
 
 from quant_sol.signals.discovery import (
+    discover_kalshi_hot_markets,
+    kalshi_interest_score,
+    kalshi_cross_venue_candidates_for_markets,
     discover_interesting_markets,
     discover_signal_source_candidates,
     market_interest_score,
@@ -8,6 +11,7 @@ from quant_sol.signals.discovery import (
     platform_watch_candidates_for_markets,
     public_seed_candidates_for_markets,
     rank_discovered_sources,
+    write_latest_kalshi_targets,
     write_latest_polymarket_targets,
     write_signal_discovery_report,
     x_query_for_market,
@@ -229,7 +233,12 @@ references:
     )
     monkeypatch.setattr("quant_sol.signals.discovery.GammaMarketClient", lambda: FakeGamma())
 
-    result = discover_signal_source_candidates(connect(tmp_path / "dry.duckdb"), dry_run=True, source_seed_path=seed_path)
+    result = discover_signal_source_candidates(
+        connect(tmp_path / "dry.duckdb"),
+        dry_run=True,
+        source_seed_path=seed_path,
+        include_kalshi=False,
+    )
 
     assert result["x_posts"] == []
     assert result["reddit_posts"] == []
@@ -237,6 +246,72 @@ references:
     assert result["public_seed_candidates"][0]["handle"] == "elonmusk"
     assert result["platform_watch"]
     assert result["source_references"][0]["label"] == "example"
+
+
+def test_kalshi_hot_markets_are_ranked_as_cross_venue_context() -> None:
+    class FakeKalshi:
+        def list_markets(self, limit=1000, max_pages=2, status="open", mve_filter="exclude"):
+            return [
+                {
+                    "ticker": "KXFED-26JUN-RATE",
+                    "event_ticker": "KXFED-26JUN",
+                    "title": "Will the Fed cut rates by June?",
+                    "volume_24h_fp": "250000",
+                    "volume_fp": "1000000",
+                    "liquidity_dollars": "50000",
+                    "open_interest_fp": "300000",
+                    "yes_bid_dollars": "0.4200",
+                    "yes_ask_dollars": "0.4500",
+                    "close_time": "2026-06-30T00:00:00Z",
+                },
+                {
+                    "ticker": "KXLOW",
+                    "title": "Dormant market",
+                    "volume_24h_fp": "0",
+                    "volume_fp": "0",
+                    "open_interest_fp": "0",
+                },
+            ]
+
+    rows = discover_kalshi_hot_markets(max_markets=5, client=FakeKalshi())
+
+    assert rows[0]["ticker"] == "KXFED-26JUN-RATE"
+    assert rows[0]["edge_classification"] == "cross_venue_context"
+    assert rows[0]["data_provenance"]["source_activity"] == "observed_kalshi_public_market_api"
+    assert "no_order_execution" in rows[0]["risk_tags"]
+
+
+def test_kalshi_cross_venue_matches_require_rule_and_spread_checks() -> None:
+    market = MarketRecord(
+        market_slug="fed-cut-rates-by-june",
+        event_slug="fed-rates",
+        question="Will the Fed cut rates by June?",
+        category="Macro",
+        tags=["Fed", "rates"],
+        end_time=None,
+        resolution_source=None,
+        clob_token_ids=["yes-token"],
+        liquidity=500_000,
+        raw={},
+    )
+
+    rows = kalshi_cross_venue_candidates_for_markets(
+        [{"record": market, "score": 80, "query_terms": ["fed", "rates"], "liquidity": 500_000, "deadline_days": 30}],
+        [
+            {
+                "ticker": "KXFED-26JUN-RATE",
+                "title": "Will the Fed cut rates by June?",
+                "heat_score": 70,
+                "volume_24h": 250000,
+                "spread": 0.03,
+                "query_terms": ["fed", "rates", "june"],
+            }
+        ],
+    )
+
+    assert rows[0]["recommended_status"] == "cross_venue_context"
+    assert rows[0]["tradability"]["status"] == "not_tradable_without_rule_mapping_and_spread_check"
+    assert "venue_rule_mismatch" in rows[0]["risk_tags"]
 
 
 def test_signal_discovery_report_includes_preflight_platforms_and_model_review(tmp_path) -> None:
@@ -279,6 +354,26 @@ def test_signal_discovery_report_includes_preflight_platforms_and_model_review(t
                     "risk_tags": ["no_private_scraping"],
                 }
             ],
+            "kalshi_hot_markets": [
+                {
+                    "ticker": "KXIRAN-PEACE",
+                    "category": "geopolitics",
+                    "heat_score": 55,
+                    "volume_24h": 100000,
+                    "liquidity": 50000,
+                    "spread": 0.02,
+                    "query_terms": ["iran", "peace"],
+                }
+            ],
+            "kalshi_cross_venue": [
+                {
+                    "kalshi_ticker": "KXIRAN-PEACE",
+                    "market_slug": "us-iran-peace",
+                    "discovery_score": 40,
+                    "recommended_status": "cross_venue_context",
+                    "risk_tags": ["cross_venue_context", "venue_rule_mismatch"],
+                }
+            ],
             "source_references": [{"label": "Polymarket API docs", "url": "https://docs.polymarket.com/api-reference/introduction"}],
         },
         tmp_path,
@@ -287,8 +382,11 @@ def test_signal_discovery_report_includes_preflight_platforms_and_model_review(t
     text = path.read_text(encoding="utf-8")
     assert "## Public Seed Preflight" in text
     assert "## Reddit And Discord Watch" in text
+    assert "## Kalshi Hot Pool Context" in text
+    assert "## Kalshi Cross-Venue Matches" in text
     assert "## Model Review Discipline" in text
     assert "no_private_scraping" in text
+    assert "venue_rule_mismatch" in text
     assert "Polymarket API docs" in text
 
 
@@ -370,6 +468,44 @@ def test_latest_polymarket_targets_classifies_warnock_as_us_politics(tmp_path) -
     )
 
     assert "| 1 | us_politics |" in path.read_text(encoding="utf-8")
+
+
+def test_latest_kalshi_targets_file_is_overwritten(tmp_path) -> None:
+    path = tmp_path / "latest-kalshi.md"
+    path.write_text("old content", encoding="utf-8")
+    row = {
+        "ticker": "KXCHINATAIWAN-26",
+        "event_ticker": "KXCHINATAIWAN",
+        "title": "Will China invade Taiwan in 2026?",
+        "yes_bid_dollars": "0.1200",
+        "yes_ask_dollars": "0.1500",
+        "volume_24h": "250000",
+        "open_interest": "500000",
+        "close_time": "2026-06-30T00:00:00Z",
+    }
+
+    write_latest_kalshi_targets(
+        {
+            "markets": [
+                {
+                    "record": row,
+                    "score": kalshi_interest_score(row, datetime(2026, 5, 16, tzinfo=timezone.utc)),
+                    "volume": 250000,
+                    "open_interest": 500000,
+                    "spread": 0.03,
+                    "deadline_days": 45,
+                    "query_terms": ["china", "taiwan", "invade"],
+                    "category": "geopolitics",
+                }
+            ]
+        },
+        path,
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert "old content" not in text
+    assert "`KXCHINATAIWAN-26`" in text
+    assert "| 1 | geopolitics |" in text
 
 
 def test_narrative_focus_filters_sports_markets(monkeypatch) -> None:

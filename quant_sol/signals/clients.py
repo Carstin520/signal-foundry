@@ -9,6 +9,7 @@ import requests
 
 from .config import (
     GAMMA_API_BASE_URL,
+    KALSHI_API_BASE_URL,
     POLYMARKET_CLOB_BASE_URL,
     POLYMARKET_CLOB_WS_URL,
     X_API_BASE_URL,
@@ -54,6 +55,40 @@ class GammaMarketClient:
                 records.append(record)
                 seen.add(record.market_slug)
         return records
+
+
+class KalshiMarketClient:
+    def __init__(self, base_url: str = KALSHI_API_BASE_URL, timeout: int = 30) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({"Accept": "application/json", "User-Agent": "signal-foundry-research-os/0.1"})
+
+    def list_markets(
+        self,
+        limit: int = 1000,
+        max_pages: int = 2,
+        status: str = "open",
+        *,
+        mve_filter: Optional[str] = "exclude",
+    ) -> List[dict]:
+        markets: List[dict] = []
+        cursor: Optional[str] = None
+        for _ in range(max_pages):
+            params = {"limit": max(1, min(limit, 1000)), "status": status}
+            if mve_filter:
+                params["mve_filter"] = mve_filter
+            if cursor:
+                params["cursor"] = cursor
+            response = self.session.get(f"{self.base_url}/markets", params=params, timeout=self.timeout)
+            response.raise_for_status()
+            payload = response.json()
+            rows = payload.get("markets") or []
+            markets.extend(item for item in rows if isinstance(item, dict))
+            cursor = payload.get("cursor")
+            if not rows or not cursor:
+                break
+        return markets
 
 
 class DataApiClient:

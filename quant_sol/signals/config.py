@@ -23,6 +23,7 @@ SIGNAL_REPORT_ROOT = DATA_ROOT / "reports"
 
 POLYMARKET_CLOB_BASE_URL = "https://clob.polymarket.com"
 POLYMARKET_CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+KALSHI_API_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 X_API_BASE_URL = "https://api.x.com/2"
 TELEGRAM_API_BASE_URL = "https://api.telegram.org"
 

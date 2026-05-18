@@ -15,6 +15,10 @@ references:
     url: https://www.reddit.com/r/polymarketAnalysis/comments/1tcyud0/here_are_the_5_highestquality_polymarket_trades/
   - label: OpenIntel
     url: https://openintel.world/
+  - label: Kalshi API docs
+    url: https://docs.kalshi.com/api-reference/market/get-markets
+  - label: Kalshi market discovery help
+    url: https://help.kalshi.com/en/articles/13823842-finding-markets
 
 platform_defaults:
   x:

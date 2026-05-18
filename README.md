@@ -306,6 +306,8 @@ python3 -m quant_sol.signals discover-signal-sources \
 
 The public seed layer is configured in `config/source_discovery_v2.yaml`. It maps market terms to X accounts, low-confidence Reddit contexts, and manual/public Discord watch targets. Reports mark public seeds as preflight hints until repeated post-to-price evidence validates lead time.
 
+Discovery also includes Kalshi public hot-pool context by default. Kalshi markets are treated as cross-venue discussion scope only: reports require rule/deadline/spread/liquidity mapping before any Polymarket inference, and no broker, credential, or order endpoint is used.
+
 ### 5. Wallet Research
 
 ```bash
@@ -323,6 +325,7 @@ The wallet collector is read-only. It does not use private keys, trading APIs, o
 | Check X API setup | `python3 -m quant_sol.signals check-api --service x --handle WuBlockchain` |
 | Discover markets | `python3 -m quant_sol.signals discover-markets --category politics` |
 | Discover signal sources | `python3 -m quant_sol.signals discover-signal-sources --focus narrative --max-markets 8 --daily-cap 200 --include-public-seeds` |
+| Discover Kalshi targets | `python3 -m quant_sol.signals discover-kalshi-targets --focus narrative --max-markets 12` |
 | Evaluate one account source | `python3 -m quant_sol.signals evaluate-account-source --handle _FORAB --lookback 7d --daily-cap 200` |
 | Diagnose scoring/model setup | `python3 -m quant_sol.signals diagnose-model` |
 | Mine historical price events | `python3 -m quant_sol.signals mine-price-events --case <case>` |

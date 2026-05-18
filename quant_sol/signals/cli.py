@@ -40,8 +40,10 @@ from .config import (
 from .env import has_secret, load_local_env, masked_secret
 from .diagnostics import model_diagnostics, write_model_diagnostics
 from .discovery import (
+    discover_kalshi_targets,
     discover_signal_source_candidates,
     planned_x_calls_for_discovery,
+    write_latest_kalshi_targets,
     write_latest_polymarket_targets,
     write_signal_discovery_report,
 )
@@ -132,6 +134,9 @@ def discover_signal_sources(
     include_reddit: bool = typer.Option(True, "--include-reddit/--no-reddit", help="Use public Reddit search as low-confidence context."),
     reddit_limit: int = typer.Option(5, "--reddit-limit", help="Maximum Reddit context posts per market."),
     include_public_seeds: bool = typer.Option(True, "--include-public-seeds/--no-public-seeds", help="Map public preflight X/Reddit/Discord seed sources before X API search."),
+    include_kalshi: bool = typer.Option(True, "--include-kalshi/--no-kalshi", help="Include Kalshi public hot markets as read-only cross-venue context."),
+    kalshi_limit: int = typer.Option(10, "--kalshi-limit", help="Maximum Kalshi hot markets to include in discovery context."),
+    kalshi_max_pages: int = typer.Option(2, "--kalshi-max-pages", help="Kalshi market-list pages to scan for hot-pool context."),
     source_seed_path: Optional[Path] = typer.Option(None, "--source-seed-path", help="Optional public seed config path for discovery V2."),
     latest_targets_path: Optional[Path] = typer.Option(None, "--latest-targets-path", help="Overwrite a concise latest-targets markdown file."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Plan market and X API usage without external X/reddit searches."),
@@ -158,6 +163,9 @@ def discover_signal_sources(
         include_reddit=include_reddit and not dry_run,
         reddit_limit=reddit_limit,
         include_public_seeds=include_public_seeds,
+        include_kalshi=include_kalshi,
+        kalshi_limit=kalshi_limit,
+        kalshi_max_pages=kalshi_max_pages,
         source_seed_path=source_seed_path,
         dry_run=dry_run,
     )
@@ -172,6 +180,27 @@ def discover_signal_sources(
     if latest_targets_path:
         latest_path = write_latest_polymarket_targets(result, latest_targets_path)
         console.print(f"Wrote latest Polymarket targets: {latest_path}")
+
+
+@app.command("discover-kalshi-targets")
+def discover_kalshi_market_targets(
+    max_markets: int = typer.Option(12, "--max-markets", help="Maximum high-interest open Kalshi markets to keep."),
+    max_pages: int = typer.Option(2, "--max-pages", help="Kalshi market-list pages to scan."),
+    min_volume: float = typer.Option(100_000, "--min-volume", help="Minimum volume or open-interest threshold."),
+    focus: str = typer.Option("narrative", "--focus", help="Market focus: narrative, politics, crypto, sports, or all."),
+    latest_targets_path: Optional[Path] = typer.Option(None, "--latest-targets-path", help="Overwrite a concise Kalshi latest-targets markdown file."),
+) -> None:
+    """Find high-interest open Kalshi markets through public market data endpoints."""
+    result = discover_kalshi_targets(
+        max_markets=max_markets,
+        max_pages=max_pages,
+        min_volume=min_volume,
+        focus=focus,
+    )
+    _render_kalshi_targets(result)
+    if latest_targets_path:
+        path = write_latest_kalshi_targets(result, latest_targets_path)
+        console.print(f"Wrote latest Kalshi targets: {path}")
 
 
 @app.command("sync-social")
@@ -1608,6 +1637,69 @@ def _render_signal_discovery(result: dict) -> None:
             str(tradability.get("status") or ""),
         )
     console.print(source_table)
+
+    kalshi_table = Table(title="Kalshi Hot Pool Context")
+    kalshi_table.add_column("Rank", justify="right")
+    kalshi_table.add_column("Category")
+    kalshi_table.add_column("Ticker")
+    kalshi_table.add_column("Heat", justify="right")
+    kalshi_table.add_column("24h Vol", justify="right")
+    kalshi_table.add_column("Spread", justify="right")
+    kalshi_table.add_column("Terms")
+    for idx, row in enumerate((result.get("kalshi_hot_markets") or [])[:20], start=1):
+        kalshi_table.add_row(
+            str(idx),
+            str(row.get("category") or ""),
+            str(row.get("ticker") or ""),
+            _fmt(row.get("heat_score")),
+            _fmt(row.get("volume_24h")),
+            _fmt(row.get("spread")),
+            ", ".join(row.get("query_terms") or []),
+        )
+    console.print(kalshi_table)
+
+    cross_venue_table = Table(title="Kalshi Cross-Venue Matches")
+    cross_venue_table.add_column("Rank", justify="right")
+    cross_venue_table.add_column("Kalshi")
+    cross_venue_table.add_column("Polymarket")
+    cross_venue_table.add_column("Score", justify="right")
+    cross_venue_table.add_column("Status")
+    cross_venue_table.add_column("Risk")
+    for idx, row in enumerate((result.get("kalshi_cross_venue") or [])[:20], start=1):
+        cross_venue_table.add_row(
+            str(idx),
+            str(row.get("kalshi_ticker") or row.get("handle") or ""),
+            str(row.get("market_slug") or ""),
+            _fmt(row.get("discovery_score")),
+            str(row.get("recommended_status") or ""),
+            ", ".join((row.get("risk_tags") or [])[:3]),
+        )
+    console.print(cross_venue_table)
+
+
+def _render_kalshi_targets(result: dict) -> None:
+    table = Table(title="High-Interest Open Kalshi Markets")
+    table.add_column("Rank", justify="right")
+    table.add_column("Category")
+    table.add_column("Ticker")
+    table.add_column("Score", justify="right")
+    table.add_column("Volume", justify="right")
+    table.add_column("Open Interest", justify="right")
+    table.add_column("Spread", justify="right")
+    table.add_column("Terms")
+    for idx, item in enumerate((result.get("markets") or [])[:30], start=1):
+        record = item.get("record") or {}
+        table.add_row(
+            str(idx),
+            str(item.get("category") or ""),
+            str(record.get("ticker") or ""),
+            _fmt(item.get("score")),
+            _fmt(item.get("volume")),
+            _fmt(item.get("open_interest")),
+            _fmt(item.get("spread")),
+            ", ".join(item.get("query_terms") or []),
+        )
+    console.print(table)
 
 
 def _render_account_source_evaluation(result: dict) -> None:
