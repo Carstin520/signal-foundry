@@ -15,12 +15,14 @@ from rich.table import Table
 
 from .accounts import (
     account_rows_from_config,
+    evaluate_account_source,
     export_account_seed_csv,
     import_accounts_csv,
     import_follow_graph_csv,
     import_posts_csv,
     rank_accounts as rank_web3_accounts,
     write_account_report,
+    write_account_source_evaluation_report,
 )
 from .clients import CLOBClient, CLOBWebSocket, DataApiClient, GammaMarketClient, XApiClient
 from .config import (
@@ -391,6 +393,99 @@ def sync_accounts(
     console.print(f"Synced {profile_count} X account profile(s) and {post_count} post(s).")
     if inactive:
         console.print(f"[yellow]Inactive handles: {', '.join(inactive)}[/yellow]")
+
+
+@app.command("evaluate-account-source")
+def evaluate_account_source_command(
+    handle: str = typer.Option("_FORAB", "--handle", help="X handle to evaluate as an ad-hoc signal source."),
+    lookback: str = typer.Option("7d", "--lookback", help="Timeline lookback window, e.g. 24h, 7d, 30d."),
+    accounts_csv: Optional[str] = typer.Option(None, "--accounts-csv", help="Optional CSV fallback for account profile rows."),
+    posts_csv: Optional[str] = typer.Option(None, "--posts-csv", help="Optional CSV fallback for post rows."),
+    max_posts: int = typer.Option(100, "--max-posts", help="Maximum X timeline posts requested."),
+    daily_cap: Optional[int] = typer.Option(None, "--daily-cap", help="Local daily X API call cap."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Estimate calls without contacting X API or writing reports."),
+) -> None:
+    """Evaluate a single public X account as a candidate source without changing watchlists."""
+    normalized = handle.lstrip("@")
+    con = connect()
+    imported_accounts = import_accounts_csv(con, Path(accounts_csv)) if accounts_csv else 0
+    imported_posts = import_posts_csv(con, Path(posts_csv)) if posts_csv else 0
+    if imported_accounts or imported_posts:
+        console.print(f"Imported {imported_accounts} account row(s) and {imported_posts} post row(s) from CSV.")
+
+    token = os.getenv("X_BEARER_TOKEN")
+    planned_calls = 0 if posts_csv else (2 if token else 0)
+    cap = daily_cap or load_x_api_limits().daily_call_cap
+    if token and not _check_x_budget(con, planned_calls, cap, dry_run, f"evaluate-account-source @{normalized} max_posts={max_posts}"):
+        return
+    if dry_run:
+        console.print(
+            f"Dry run only: would evaluate @{normalized}; planned_x_calls={planned_calls}; "
+            f"csv_posts={'yes' if posts_csv else 'no'}."
+        )
+        return
+
+    if token and not posts_csv:
+        client = XApiClient(token)
+        seconds = parse_duration(lookback)
+        try:
+            profile = client.user_profile(normalized)
+            record_api_call(con, "x", "users/by/username", notes=f"profile @{normalized}")
+            if profile:
+                metrics = profile.get("public_metrics") or {}
+                upsert_x_accounts(
+                    con,
+                    [
+                        {
+                            "handle": normalized,
+                            "user_id": profile.get("id"),
+                            "language": "mixed",
+                            "role": "elite_information",
+                            "region": "global",
+                            "priority": "ad_hoc",
+                            "followers": metrics.get("followers_count"),
+                            "following": metrics.get("following_count"),
+                            "verified": profile.get("verified"),
+                            "profile_metrics": metrics,
+                            "status": "active",
+                            "notes": "Ad-hoc account source evaluation candidate.",
+                        }
+                    ],
+                )
+                save_raw_payload("x_account_profiles", normalized, profile)
+            posts = client.backfill_user_post_dicts(normalized, seconds, max_results=max_posts)
+            record_api_call(con, "x", "users/by/username", notes=f"resolve @{normalized}")
+            record_api_call(con, "x", "users/:id/tweets", notes=f"timeline @{normalized}")
+        except RequestException as exc:
+            console.print(f"[yellow]warning: @{normalized} account evaluation sync failed: {exc}[/yellow]")
+            posts = []
+        if posts:
+            save_raw_payload("x_account_posts", normalized, [post.get("raw_json") or post for post in posts])
+            upsert_x_posts(con, posts)
+    elif not token and not posts_csv:
+        console.print(
+            "[yellow]X_BEARER_TOKEN is not set and no --posts-csv was provided. "
+            "Evaluating any existing local posts only.[/yellow]"
+        )
+        upsert_x_accounts(
+            con,
+            [
+                {
+                    "handle": normalized,
+                    "language": "mixed",
+                    "role": "elite_information",
+                    "region": "global",
+                    "priority": "ad_hoc",
+                    "status": "active",
+                    "notes": "Ad-hoc account source evaluation candidate.",
+                }
+            ],
+        )
+
+    result = evaluate_account_source(con, normalized, lookback)
+    _render_account_source_evaluation(result)
+    path = write_account_source_evaluation_report(result, SIGNAL_REPORT_ROOT)
+    console.print(f"Wrote account source evaluation report: {path}")
 
 
 @app.command("sync-follow-graph")
@@ -1513,6 +1608,40 @@ def _render_signal_discovery(result: dict) -> None:
             str(tradability.get("status") or ""),
         )
     console.print(source_table)
+
+
+def _render_account_source_evaluation(result: dict) -> None:
+    metric = result.get("metric") if isinstance(result.get("metric"), dict) else {}
+    tradability = result.get("tradability") if isinstance(result.get("tradability"), dict) else {}
+    table = Table(title=f"Account Source Evaluation @{result.get('handle')}")
+    table.add_column("Posts", justify="right")
+    table.add_column("Market Links", justify="right")
+    table.add_column("Outcomes", justify="right")
+    table.add_column("Final", justify="right")
+    table.add_column("Market Impact", justify="right")
+    table.add_column("False FOMO", justify="right")
+    table.add_column("Status")
+    table.add_column("Tradability")
+    table.add_row(
+        str(result.get("post_count") or 0),
+        str(result.get("market_link_count") or 0),
+        str(result.get("outcome_count") or 0),
+        _fmt(metric.get("final_score")),
+        _fmt(metric.get("market_impact_score")),
+        _fmt(metric.get("false_fomo_rate")),
+        str(metric.get("recommended_status") or "insufficient_x_data"),
+        str(tradability.get("status") or "unknown"),
+    )
+    console.print(table)
+
+    markets = result.get("market_counts") if isinstance(result.get("market_counts"), dict) else {}
+    if markets:
+        market_table = Table(title="Matched Markets")
+        market_table.add_column("Market")
+        market_table.add_column("Count", justify="right")
+        for market, count in list(markets.items())[:10]:
+            market_table.add_row(str(market), str(count))
+        console.print(market_table)
 
 
 def _since_iso(duration: str) -> str:

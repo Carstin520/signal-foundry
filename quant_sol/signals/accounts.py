@@ -143,6 +143,172 @@ def write_account_report(con: duckdb.DuckDBPyConnection, lookback: str, report_r
     return path
 
 
+def evaluate_account_source(
+    con: duckdb.DuckDBPyConnection,
+    handle: str,
+    lookback: str,
+    keywords: Optional[Web3NarrativeKeywords] = None,
+) -> dict:
+    normalized = handle.lstrip("@")
+    keyword_config = keywords or load_web3_keywords()
+    since = (datetime.now(timezone.utc) - timedelta(seconds=parse_duration(lookback))).replace(microsecond=0).isoformat()
+    accounts = _accounts(con)
+    profile = accounts.get(normalized) or _default_profile(normalized)
+    posts = [post for post in _posts(con, since) if str(post.get("handle") or "").lower() == normalized.lower()]
+    markets = _markets(con)
+    ticks = _market_ticks(con, since)
+    keyword_mentions = _build_mentions(posts, keyword_config)
+    direct_market_mentions = _direct_market_mentions(posts, markets)
+    mentions = _dedupe_mentions(keyword_mentions + _mentions_from_market_mentions(direct_market_mentions))
+    market_mentions = _dedupe_market_mentions(_market_mentions(keyword_mentions, markets, keyword_config) + direct_market_mentions)
+    outcomes = _market_outcomes(market_mentions, ticks)
+    metrics = _impact_metrics({normalized: profile}, mentions, [], market_mentions, outcomes, lookback, keyword_config)
+    metric = metrics[0] if metrics else _empty_metric(normalized, lookback)
+    narrative_counts = Counter(mention["narrative_key"] for mention in mentions)
+    market_counts = Counter(mention["market_slug"] for mention in market_mentions)
+    classified_posts = _classified_posts(posts, mentions, market_mentions, outcomes)
+    return {
+        "handle": normalized,
+        "lookback": lookback,
+        "generated_at": utc_now_iso(),
+        "profile": profile,
+        "post_count": len(posts),
+        "mention_count": len(mentions),
+        "market_link_count": len(market_mentions),
+        "outcome_count": len(outcomes),
+        "metric": metric,
+        "narrative_counts": dict(narrative_counts.most_common()),
+        "market_counts": dict(market_counts.most_common()),
+        "market_mentions": sorted(market_mentions, key=lambda row: float(row.get("confidence") or 0), reverse=True),
+        "outcomes": outcomes,
+        "classified_posts": classified_posts,
+        "data_provenance": {
+            "profile": "observed_x_api_or_csv" if normalized in accounts else "inferred_default_profile",
+            "posts": "observed_x_posts",
+            "market_links": "model_derived_keyword_rules",
+            "price_impact": "observed_market_ticks" if outcomes else "insufficient_tick_data",
+            "source_quality": "model_derived_account_ranking",
+        },
+        "tradability": _account_tradability(metric, outcomes),
+        "participant_lens": _account_participant_lens(metric, outcomes),
+        "required_data": [
+            "fresh X profile and timeline",
+            "matched Polymarket markets",
+            "pre/post market ticks",
+            "bid/ask spread and liquidity snapshots",
+            "enough repeated samples for account-level confidence",
+        ],
+        "failure_mode": _account_failure_mode(metric, len(posts), len(market_mentions), len(outcomes)),
+    }
+
+
+def write_account_source_evaluation_report(result: Mapping[str, object], report_root: Path) -> Path:
+    report_root.mkdir(parents=True, exist_ok=True)
+    handle = str(result.get("handle") or "account").lstrip("@")
+    path = report_root / f"account_source_eval_{handle}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.md"
+    metric = result.get("metric") if isinstance(result.get("metric"), Mapping) else {}
+    profile = result.get("profile") if isinstance(result.get("profile"), Mapping) else {}
+    tradability = result.get("tradability") if isinstance(result.get("tradability"), Mapping) else {}
+    lens = result.get("participant_lens") if isinstance(result.get("participant_lens"), Mapping) else {}
+    provenance = result.get("data_provenance") if isinstance(result.get("data_provenance"), Mapping) else {}
+    lines = [
+        f"# Account Source Evaluation: @{handle}",
+        "",
+        f"- Generated at: {result.get('generated_at')}",
+        f"- Lookback: {result.get('lookback')}",
+        f"- Posts evaluated: {result.get('post_count')}",
+        f"- Narrative/market mentions: {result.get('mention_count')}",
+        f"- Market links: {result.get('market_link_count')}",
+        f"- Price outcome rows: {result.get('outcome_count')}",
+        "",
+        "## Profile",
+        "",
+        f"- Role: {profile.get('role') or 'ad_hoc_candidate'}",
+        f"- Priority: {profile.get('priority') or 'ad_hoc'}",
+        f"- Followers: {_fmt(profile.get('followers'))}",
+        f"- Following: {_fmt(profile.get('following'))}",
+        f"- Verified: {profile.get('verified')}",
+        f"- Status: {profile.get('status') or 'active'}",
+        "",
+        "## Scorecard",
+        "",
+        "| Final | Speed | Frequency | Cascade | Market Impact | Chain | False FOMO | Sample Size | Status |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        (
+            f"| {_fmt(metric.get('final_score'))} | {_fmt(metric.get('speed_score'))} | "
+            f"{_fmt(metric.get('frequency_score'))} | {_fmt(metric.get('cascade_score'))} | "
+            f"{_fmt(metric.get('market_impact_score'))} | {_fmt(metric.get('source_chain_score'))} | "
+            f"{_fmt(metric.get('false_fomo_rate'))} | {metric.get('sample_size') or 0} | "
+            f"{metric.get('recommended_status') or 'insufficient_x_data'} |"
+        ),
+        "",
+        "## Narrative Coverage",
+        "",
+        "| Narrative | Count |",
+        "| --- | ---: |",
+    ]
+    narrative_counts = result.get("narrative_counts") if isinstance(result.get("narrative_counts"), Mapping) else {}
+    if not narrative_counts:
+        lines.append("| n/a | 0 |")
+    for key, count in narrative_counts.items():
+        lines.append(f"| {key} | {count} |")
+    lines.extend(["", "## Matched Markets", "", "| Market | Count |", "| --- | ---: |"])
+    market_counts = result.get("market_counts") if isinstance(result.get("market_counts"), Mapping) else {}
+    if not market_counts:
+        lines.append("| n/a | 0 |")
+    for key, count in market_counts.items():
+        lines.append(f"| `{key}` | {count} |")
+    lines.extend(
+        [
+            "",
+            "## Recent Classified Posts",
+            "",
+            "| Created At | Post | Classification | Markets |",
+            "| --- | --- | --- | --- |",
+        ]
+    )
+    for row in list(result.get("classified_posts") or [])[:20]:
+        lines.append(
+            f"| {row.get('created_at')} | `{row.get('post_id')}` | {row.get('classification')} | "
+            f"{', '.join(f'`{market}`' for market in row.get('markets') or []) or 'n/a'} |"
+        )
+    if not result.get("classified_posts"):
+        lines.append("| n/a | n/a | no_posts | n/a |")
+    lines.extend(
+        [
+            "",
+            "## Price Impact Samples",
+            "",
+            "| Post | Market | Horizon | Entry | Future | Delta | Max Fav | Max Adv | Positive |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
+    outcomes = list(result.get("outcomes") or [])
+    if not outcomes:
+        lines.append("| n/a | n/a | n/a | 0 | 0 | 0 | 0 | 0 | false |")
+    for row in outcomes[:30]:
+        lines.append(
+            f"| `{row.get('post_id')}` | `{row.get('market_slug')}` | {row.get('horizon')} | "
+            f"{_fmt(row.get('entry_mid'))} | {_fmt(row.get('future_mid'))} | {_fmt(row.get('delta'))} | "
+            f"{_fmt(row.get('max_favorable_delta'))} | {_fmt(row.get('max_adverse_delta'))} | {row.get('is_positive')} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Model Review",
+            "",
+            f"- Edge classification: {metric.get('recommended_status') or 'insufficient_x_data'}",
+            f"- Tradability: status={tradability.get('status')}, first_failure={tradability.get('cost_first_failure')}",
+            f"- Participant lens: retail={lens.get('retail')}, institution={lens.get('institution')}, market_maker={lens.get('market_maker')}",
+            f"- Provenance: profile={provenance.get('profile')}, posts={provenance.get('posts')}, market_links={provenance.get('market_links')}, price_impact={provenance.get('price_impact')}",
+            f"- Failure mode: {result.get('failure_mode')}",
+            "- This is a read-only source evaluation. It does not add the account to a live watchlist or create any execution path.",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
 def export_account_seed_csv(accounts: Sequence[Web3AccountConfig], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -732,6 +898,134 @@ def _latest_source_chains(con: duckdb.DuckDBPyConnection) -> List[dict]:
     ).fetchall()
     columns = [desc[0] for desc in con.description]
     return [dict(zip(columns, row)) for row in rows]
+
+
+def _default_profile(handle: str) -> dict:
+    return {
+        "handle": handle,
+        "language": "mixed",
+        "role": "elite_information",
+        "region": "global",
+        "priority": "ad_hoc",
+        "followers": None,
+        "following": None,
+        "verified": None,
+        "status": "active",
+    }
+
+
+def _empty_metric(handle: str, lookback: str) -> dict:
+    return {
+        "account": handle,
+        "lookback": lookback,
+        "speed_score": 0.0,
+        "frequency_score": 0.0,
+        "cascade_score": 0.0,
+        "market_impact_score": 0.0,
+        "source_chain_score": 0.0,
+        "false_fomo_rate": 0.0,
+        "final_score": 0.0,
+        "recommended_status": "insufficient_x_data",
+        "sample_size": 0,
+        "market_link_coverage": 0.0,
+    }
+
+
+def _classified_posts(
+    posts: Sequence[dict],
+    mentions: Sequence[dict],
+    market_mentions: Sequence[dict],
+    outcomes: Sequence[dict],
+) -> List[dict]:
+    mentions_by_post = defaultdict(list)
+    markets_by_post = defaultdict(list)
+    outcomes_by_post = defaultdict(list)
+    for mention in mentions:
+        mentions_by_post[str(mention.get("post_id") or "")].append(mention)
+    for mention in market_mentions:
+        markets_by_post[str(mention.get("post_id") or "")].append(mention)
+    for outcome in outcomes:
+        outcomes_by_post[str(outcome.get("post_id") or "")].append(outcome)
+    rows = []
+    for post in sorted(posts, key=lambda row: str(row.get("created_at") or ""), reverse=True):
+        post_id = str(post.get("post_id") or "")
+        post_outcomes = outcomes_by_post.get(post_id, [])
+        if any(outcome.get("is_positive") for outcome in post_outcomes):
+            classification = "price_validated_candidate"
+        elif post_outcomes:
+            classification = "false_or_unproven_fomo"
+        elif markets_by_post.get(post_id):
+            classification = "matched_market_no_tick_data"
+        elif mentions_by_post.get(post_id):
+            classification = "narrative_context_only"
+        else:
+            classification = "non_actionable_context"
+        rows.append(
+            {
+                "post_id": post_id,
+                "created_at": str(post.get("created_at") or ""),
+                "classification": classification,
+                "markets": sorted({str(row.get("market_slug") or "") for row in markets_by_post.get(post_id, []) if row.get("market_slug")}),
+            }
+        )
+    return rows
+
+
+def _account_tradability(metric: Mapping[str, object], outcomes: Sequence[dict]) -> dict:
+    sample_size = int(metric.get("sample_size") or 0)
+    if sample_size == 0:
+        return {
+            "status": "insufficient_price_evidence",
+            "cost_first_failure": "no_matched_tick_outcomes",
+            "required_check": "collect market ticks around matched posts before promotion",
+        }
+    false_fomo = float(metric.get("false_fomo_rate") or 0)
+    if false_fomo >= 0.5:
+        status = "blocked"
+        failure = "false_fomo"
+    else:
+        status = "research_candidate"
+        failure = "unknown_until_spread_slippage_check"
+    return {
+        "status": status,
+        "cost_first_failure": failure,
+        "sample_size": sample_size,
+        "positive_outcomes": sum(1 for outcome in outcomes if outcome.get("is_positive")),
+        "required_check": "evaluate 1m/5m/10m path with spread, liquidity, and already-moved filters",
+    }
+
+
+def _account_participant_lens(metric: Mapping[str, object], outcomes: Sequence[dict]) -> dict:
+    sample_size = int(metric.get("sample_size") or 0)
+    if sample_size == 0:
+        return {
+            "retail": "watch_only_until_price_path_exists",
+            "institution": "insufficient_repeatability",
+            "market_maker": "context_only_no_adverse_selection_signal",
+        }
+    if float(metric.get("false_fomo_rate") or 0) >= 0.5:
+        return {
+            "retail": "blocked_by_false_fomo",
+            "institution": "blocked_by_low_hit_rate",
+            "market_maker": "possible_noise_flow_only",
+        }
+    return {
+        "retail": "candidate_after_simple_entry_exit_check",
+        "institution": "candidate_after_capacity_and_sample_size_check",
+        "market_maker": "watch_for_adverse_selection_and_inventory_pressure",
+    }
+
+
+def _account_failure_mode(metric: Mapping[str, object], post_count: int, market_links: int, outcomes: int) -> str:
+    if post_count == 0:
+        return "no public posts in the selected lookback or missing X/CSV input"
+    if market_links == 0:
+        return "posts did not strongly map to configured Polymarket markets"
+    if outcomes == 0:
+        return "market links exist but local ticks are insufficient for price-path validation"
+    if float(metric.get("false_fomo_rate") or 0) >= 0.5:
+        return "matched posts did not repeatedly precede favorable price movement"
+    return "sample may still be too small or cost-sensitive after spread and slippage"
 
 
 def _nearest_tick(ticks: Sequence[dict], target: datetime, before: bool) -> Optional[dict]:

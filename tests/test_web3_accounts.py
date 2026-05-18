@@ -3,7 +3,7 @@ from typing import List, Optional
 
 from typer.testing import CliRunner
 
-from quant_sol.signals.accounts import match_web3_narratives, rank_accounts
+from quant_sol.signals.accounts import evaluate_account_source, match_web3_narratives, rank_accounts, write_account_source_evaluation_report
 from quant_sol.signals.cli import app
 from quant_sol.signals.config import Web3NarrativeKeywords
 from quant_sol.signals.models import MarketRecord
@@ -173,6 +173,97 @@ def test_fast_web3_accounts_can_match_non_web3_markets(tmp_path) -> None:
     assert round(matched[0][3], 2) == 0.83
     assert account["sample_size"] == 1
     assert account["market_impact_score"] > 0
+
+
+def test_evaluate_account_source_reports_single_handle_price_context(tmp_path) -> None:
+    con = connect(tmp_path / "account_eval.duckdb")
+    upsert_x_accounts(
+        con,
+        [
+            {"handle": "_FORAB", "language": "en", "region": "global", "role": "elite_information", "priority": "ad_hoc", "status": "active"},
+        ],
+    )
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    upsert_x_posts(
+        con,
+        [
+            _post("forab-1", "_FORAB", now - timedelta(hours=24), "Bitcoin ETF and SEC approval chatter is heating up", 12),
+            _post("forab-2", "_FORAB", now - timedelta(hours=1), "gm", 0),
+        ],
+    )
+    upsert_markets(
+        con,
+        [
+            MarketRecord(
+                market_slug="will-bitcoin-hit-150k-this-month",
+                event_slug="bitcoin-price",
+                question="Will Bitcoin hit $150k this month?",
+                category="Crypto",
+                tags=["Bitcoin", "ETF", "SEC"],
+                end_time=(now + timedelta(days=20)).isoformat(),
+                resolution_source=None,
+                clob_token_ids=["yes-token"],
+                liquidity=100_000,
+                raw={},
+            )
+        ],
+    )
+    insert_market_tick(con, (now - timedelta(hours=25)).isoformat(), "will-bitcoin-hit-150k-this-month", "yes-token", 0.19, 0.21, None, 100_000, {})
+    insert_market_tick(con, (now - timedelta(hours=1)).isoformat(), "will-bitcoin-hit-150k-this-month", "yes-token", 0.25, 0.27, None, 100_000, {})
+
+    result = evaluate_account_source(con, "_FORAB", "30d", KEYWORDS)
+
+    assert result["handle"] == "_FORAB"
+    assert result["post_count"] == 2
+    assert result["market_link_count"] >= 1
+    assert result["metric"]["sample_size"] == 1
+    assert result["tradability"]["status"] == "research_candidate"
+    assert result["data_provenance"]["market_links"] == "model_derived_keyword_rules"
+    by_post = {row["post_id"]: row for row in result["classified_posts"]}
+    assert by_post["forab-1"]["classification"] == "price_validated_candidate"
+    assert by_post["forab-2"]["classification"] == "non_actionable_context"
+
+
+def test_account_source_evaluation_report_includes_required_review_sections(tmp_path) -> None:
+    result = {
+        "handle": "_FORAB",
+        "generated_at": "2026-05-18T00:00:00+00:00",
+        "lookback": "7d",
+        "post_count": 1,
+        "mention_count": 1,
+        "market_link_count": 1,
+        "outcome_count": 0,
+        "profile": {"role": "elite_information", "priority": "ad_hoc", "status": "active"},
+        "metric": {"final_score": 0, "recommended_status": "insufficient_market_data", "sample_size": 0},
+        "narrative_counts": {"ecosystems": 1},
+        "market_counts": {"will-bitcoin-hit-150k-this-month": 1},
+        "classified_posts": [{"post_id": "p1", "created_at": "2026-05-18T00:00:00+00:00", "classification": "matched_market_no_tick_data", "markets": ["will-bitcoin-hit-150k-this-month"]}],
+        "outcomes": [],
+        "tradability": {"status": "insufficient_price_evidence", "cost_first_failure": "no_matched_tick_outcomes"},
+        "participant_lens": {"retail": "watch_only_until_price_path_exists", "institution": "insufficient_repeatability", "market_maker": "context_only_no_adverse_selection_signal"},
+        "data_provenance": {"profile": "observed_x_api_or_csv", "posts": "observed_x_posts", "market_links": "model_derived_keyword_rules", "price_impact": "insufficient_tick_data"},
+        "failure_mode": "market links exist but local ticks are insufficient for price-path validation",
+    }
+
+    path = write_account_source_evaluation_report(result, tmp_path)
+    text = path.read_text(encoding="utf-8")
+
+    assert "Account Source Evaluation: @_FORAB" in text
+    assert "## Scorecard" in text
+    assert "## Model Review" in text
+    assert "insufficient_price_evidence" in text
+    assert "read-only source evaluation" in text
+
+
+def test_evaluate_account_source_cli_dry_run_does_not_write_report(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("X_BEARER_TOKEN", "token")
+
+    result = CliRunner().invoke(app, ["evaluate-account-source", "--handle", "_FORAB", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "Dry run only" in result.stdout
+    assert not (tmp_path / "data" / "reports").exists()
 
 
 def test_sync_accounts_without_x_token_uses_fallback_warning(tmp_path, monkeypatch) -> None:

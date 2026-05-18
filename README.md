@@ -279,6 +279,18 @@ python3 -m quant_sol.signals report-accounts --lookback 30d
 python3 -m quant_sol.signals export-account-seeds --format csv
 ```
 
+Single-account source evaluation:
+
+```bash
+python3 -m quant_sol.signals evaluate-account-source \
+  --handle _FORAB \
+  --lookback 7d \
+  --daily-cap 200 \
+  --max-posts 100
+```
+
+This keeps the account as an ad-hoc candidate and writes a local report with profile, narrative coverage, market links, price impact samples, tradability, provenance, and participant-lens review.
+
 ### 4.5 Source Discovery V2
 
 Run the preflight-first discovery path when you want current source candidates before spending X API calls:
@@ -311,6 +323,7 @@ The wallet collector is read-only. It does not use private keys, trading APIs, o
 | Check X API setup | `python3 -m quant_sol.signals check-api --service x --handle WuBlockchain` |
 | Discover markets | `python3 -m quant_sol.signals discover-markets --category politics` |
 | Discover signal sources | `python3 -m quant_sol.signals discover-signal-sources --focus narrative --max-markets 8 --daily-cap 200 --include-public-seeds` |
+| Evaluate one account source | `python3 -m quant_sol.signals evaluate-account-source --handle _FORAB --lookback 7d --daily-cap 200` |
 | Diagnose scoring/model setup | `python3 -m quant_sol.signals diagnose-model` |
 | Mine historical price events | `python3 -m quant_sol.signals mine-price-events --case <case>` |
 | Plan bounded source search | `python3 -m quant_sol.signals plan-source-backfill --case <case>` |
