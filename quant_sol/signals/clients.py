@@ -9,6 +9,7 @@ import requests
 
 from .config import (
     GAMMA_API_BASE_URL,
+    HYPERLIQUID_INFO_API_URL,
     KALSHI_API_BASE_URL,
     POLYMARKET_CLOB_BASE_URL,
     POLYMARKET_CLOB_WS_URL,
@@ -89,6 +90,29 @@ class KalshiMarketClient:
             if not rows or not cursor:
                 break
         return markets
+
+
+class HyperliquidInfoClient:
+    def __init__(self, base_url: str = HYPERLIQUID_INFO_API_URL, timeout: int = 30) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({"Accept": "application/json", "User-Agent": "signal-foundry-research-os/0.1"})
+
+    def info(self, payload: dict) -> dict:
+        response = self.session.post(self.base_url, json=payload, timeout=self.timeout)
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else {"data": data}
+
+    def outcome_meta(self) -> dict:
+        return self.info({"type": "outcomeMeta"})
+
+    def all_mids(self) -> dict:
+        return self.info({"type": "allMids"})
+
+    def l2_book(self, coin: str) -> dict:
+        return self.info({"type": "l2Book", "coin": coin})
 
 
 class DataApiClient:

@@ -18,12 +18,14 @@ WEB3_ACCOUNT_WATCHLIST_PATH = CONFIG_ROOT / "web3_account_watchlist.yaml"
 WEB3_NARRATIVE_KEYWORDS_PATH = CONFIG_ROOT / "web3_narrative_keywords.yaml"
 API_LIMITS_PATH = CONFIG_ROOT / "api_limits.yaml"
 SEMANTIC_MATCHING_PATH = CONFIG_ROOT / "semantic_matching.yaml"
+PREDICTION_VENUES_PATH = CONFIG_ROOT / "prediction_venues.yaml"
 SIGNAL_RAW_ROOT = DATA_ROOT / "raw" / "signals"
 SIGNAL_REPORT_ROOT = DATA_ROOT / "reports"
 
 POLYMARKET_CLOB_BASE_URL = "https://clob.polymarket.com"
 POLYMARKET_CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 KALSHI_API_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
+HYPERLIQUID_INFO_API_URL = "https://api.hyperliquid.xyz/info"
 X_API_BASE_URL = "https://api.x.com/2"
 TELEGRAM_API_BASE_URL = "https://api.telegram.org"
 
@@ -277,6 +279,12 @@ def load_semantic_matching_config(path: Path = SEMANTIC_MATCHING_PATH) -> Semant
         case_seed_concepts=seed_concepts,
         case_exclude_concepts=exclude_concepts,
     )
+
+
+def load_prediction_venues(path: Path = PREDICTION_VENUES_PATH) -> Mapping[str, object]:
+    payload = load_yaml(path)
+    venues = payload.get("prediction_venues")
+    return venues if isinstance(venues, dict) else {}
 
 
 def normalize_handle(handle: str) -> str:

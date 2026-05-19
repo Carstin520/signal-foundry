@@ -1,0 +1,85 @@
+prediction_venues:
+  polymarket:
+    role: narrative_fomo_primary
+    strengths:
+      - social discovery
+      - public narrative repricing
+      - broad political/geopolitical/crypto markets
+    primary_tests:
+      - post_to_price_lead_time
+      - 1m_5m_10m_move
+      - already_moved_before_post
+      - spread_liquidity_check
+    edge_classification:
+      primary: narrative_fomo_edge
+      secondary:
+        - liquidity_latency_edge
+        - statistical_edge
+    data_provenance:
+      market_metadata: observed_gamma_api
+      price_path: observed_clob_ticks_or_historical_midpoints
+      source_activity: observed_public_social_posts
+    failure_modes:
+      - stale_backfill
+      - already_moved_before_post
+      - thin_liquidity
+      - wide_spread
+      - official_confirmation_late
+    execution_policy: read_only_research
+
+  kalshi:
+    role: regulated_event_context
+    strengths:
+      - rule quality
+      - event-contract structure
+      - regulated market taxonomy
+    primary_tests:
+      - rule_mapping
+      - deadline_and_resolution_comparison
+      - orderbook_depth
+      - cross_venue_context_only_until_validated
+    edge_classification:
+      primary: cross_venue_context
+      secondary:
+        - statistical_edge
+        - liquidity_latency_edge
+    data_provenance:
+      market_metadata: observed_public_market_api
+      orderbook: observed_public_orderbook_api
+      cross_venue_mapping: inferred_until_rules_compared
+    failure_modes:
+      - venue_rule_mismatch
+      - jurisdiction_or_fee_difference
+      - sports_or_props_dominating_heat_score
+      - thin_or_stale_orderbook
+    execution_policy: read_only_research
+
+  hyperliquid_hip4:
+    role: high_frequency_outcome_clob
+    strengths:
+      - live CLOB depth
+      - allMids/l2Book/WebSocket access
+      - BTC/ETH outcome markets
+      - direct perp hedge context
+    primary_tests:
+      - outcome_meta_parse
+      - mid_and_l2book_capture
+      - spread_depth_inertia
+      - perp_spot_outcome_relative_value
+      - digital_option_like_price_path
+    edge_classification:
+      primary: liquidity_latency_or_model_relative_edge
+      secondary:
+        - high_frequency_clob_context
+        - narrative_fomo_edge
+    data_provenance:
+      outcome_metadata: observed_hyperliquid_outcome_meta
+      price_path: observed_all_mids_or_l2_book
+      hedge_context: inferred_from_perp_or_spot_market
+    failure_modes:
+      - oracle_or_settlement_rule_misread
+      - model_assumption_error
+      - thin_depth_near_expiry
+      - hedge_basis_risk
+      - treating_digital_option_as_simple_probability
+    execution_policy: read_only_research

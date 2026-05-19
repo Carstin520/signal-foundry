@@ -12,7 +12,7 @@ import duckdb
 import requests
 import yaml
 
-from .clients import GammaMarketClient, KalshiMarketClient, XApiClient, market_record_from_gamma
+from .clients import GammaMarketClient, HyperliquidInfoClient, KalshiMarketClient, XApiClient, market_record_from_gamma
 from .models import MarketRecord
 from .storage import save_raw_payload, upsert_markets, upsert_signal_discovery_sources, upsert_x_posts
 from .utils import first_float, stable_hash, to_datetime, utc_now_iso, words
@@ -1138,6 +1138,144 @@ def write_latest_kalshi_targets(result: Mapping[str, object], path: Path, *, max
     return path
 
 
+def discover_hyperliquid_hip4_targets(
+    *,
+    max_markets: int = 12,
+    include_orderbooks: bool = True,
+    client: Optional[HyperliquidInfoClient] = None,
+) -> dict:
+    client = client or HyperliquidInfoClient()
+    meta = client.outcome_meta()
+    mids = client.all_mids()
+    outcomes = [item for item in meta.get("outcomes") or [] if isinstance(item, dict)]
+    questions = [item for item in meta.get("questions") or [] if isinstance(item, dict)]
+    question_by_outcome = _hyperliquid_question_by_outcome(questions)
+    markets = []
+    for outcome in outcomes:
+        outcome_id = outcome.get("outcome")
+        if outcome_id is None:
+            continue
+        side_specs = outcome.get("sideSpecs") if isinstance(outcome.get("sideSpecs"), list) else []
+        if not side_specs:
+            side_specs = [{"name": "Yes"}, {"name": "No"}]
+        for side_index, side in enumerate(side_specs):
+            coin = f"#{outcome_id}{side_index}"
+            mid = _optional_float(mids.get(coin))
+            book = client.l2_book(coin) if include_orderbooks else {}
+            top = _hyperliquid_book_summary(book)
+            row = {
+                "venue": "hyperliquid_hip4",
+                "coin": coin,
+                "outcome": outcome_id,
+                "side_index": side_index,
+                "side": str((side or {}).get("name") or side_index),
+                "name": outcome.get("name") or "",
+                "description": outcome.get("description") or "",
+                "question": question_by_outcome.get(int(outcome_id), {}),
+                "descriptor": _hyperliquid_descriptor(outcome.get("description") or ""),
+                "mid": mid,
+                "best_bid": top.get("best_bid"),
+                "best_ask": top.get("best_ask"),
+                "spread": top.get("spread"),
+                "bid_depth": top.get("bid_depth"),
+                "ask_depth": top.get("ask_depth"),
+                "book_levels": top.get("book_levels"),
+                "score": hyperliquid_hip4_interest_score(mid=mid, spread=top.get("spread"), bid_depth=top.get("bid_depth"), ask_depth=top.get("ask_depth"), description=str(outcome.get("description") or "")),
+                "category": _hyperliquid_category(outcome.get("description") or ""),
+                "query_terms": _hyperliquid_query_terms(outcome),
+                "edge_classification": "liquidity_latency_or_model_relative_edge",
+                "data_provenance": {
+                    "outcome_metadata": "observed_hyperliquid_outcome_meta",
+                    "price_path": "observed_all_mids_and_l2_book" if include_orderbooks else "observed_all_mids",
+                    "hedge_context": "inferred_from_underlying_perp_or_spot_market",
+                },
+                "participant_lens": {
+                    "retail": "bounded_loss_digital_outcome_but_rule_sensitive",
+                    "institution": "portfolio_or_event_hedge_context_after_capacity_check",
+                    "market_maker": "inventory_and_delta_hedge_context_against_perp_or_spot",
+                },
+                "tradability": {
+                    "status": "research_only_until_spread_depth_and_settlement_checked",
+                    "required_check": "validate outcome rules, l2 depth, spread, expiry, and hedge basis before promotion",
+                },
+                "risk_tags": ["hyperliquid_hip4", "high_frequency_clob_context", "perp_hedge_context", "no_order_execution"],
+                "failure_mode": "digital-outcome prices can look like probabilities while still embedding spread, hedge basis, oracle, and expiry risk",
+                "raw": {"outcome": outcome, "book": book},
+            }
+            if row["score"] > 0:
+                markets.append(row)
+    return {"markets": sorted(markets, key=lambda item: item["score"], reverse=True)[:max_markets], "raw_meta": meta}
+
+
+def hyperliquid_hip4_interest_score(
+    *,
+    mid: Optional[float],
+    spread: Optional[float],
+    bid_depth: Optional[float],
+    ask_depth: Optional[float],
+    description: str,
+) -> float:
+    depth = min(_positive_float(bid_depth), _positive_float(ask_depth))
+    depth_score = min(35.0, math.log10(max(depth, 1)) * 10.0)
+    spread_score = 12.0 if spread is None else max(0.0, 28.0 - float(spread) * 600.0)
+    mid_score = 0.0 if mid is None else max(0.0, 12.0 - abs(float(mid) - 0.5) * 16.0)
+    descriptor = _hyperliquid_descriptor(description)
+    underlying_bonus = 8.0 if descriptor.get("underlying") in {"BTC", "ETH", "SOL"} else 0.0
+    class_bonus = 8.0 if str(descriptor.get("class") or "").lower() in {"pricebinary", "pricebucket"} else 0.0
+    return round(max(0.0, depth_score + spread_score + mid_score + underlying_bonus + class_bonus), 3)
+
+
+def write_latest_hyperliquid_hip4_targets(result: Mapping[str, object], path: Path, *, max_targets: int = 12) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    markets = list(result.get("markets") or [])[:max_targets]
+    lines = [
+        "# Latest Hyperliquid HIP-4 Targets",
+        "",
+        "This file is overwritten by the combined prediction-market discovery heartbeat.",
+        "",
+        f"- Last updated: {utc_now_iso()}",
+        f"- Markets scanned: {len(result.get('markets') or [])}",
+        "- Venue: Hyperliquid HIP-4 public info endpoint",
+        "- Venue role: high_frequency_outcome_clob",
+        "",
+        "## Selection Rules",
+        "",
+        "- Prefer outcome markets with observable allMids and l2Book depth.",
+        "- Treat priceBinary and priceBucket outcomes as digital-option-like markets, not simple social probabilities.",
+        "- Use perp/spot hedge context only as an inferred research lens until explicitly validated.",
+        "- Do not use trading APIs, private keys, wallet signatures, or order endpoints.",
+        "",
+        "## Current Targets",
+        "",
+        "| Rank | Coin | Side | Category | Score | Mid | Bid | Ask | Spread | Depth | Descriptor |",
+        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    if not markets:
+        lines.append("| n/a | n/a | n/a | n/a | 0 | n/a | n/a | n/a | n/a | n/a | n/a |")
+    for idx, row in enumerate(markets, start=1):
+        descriptor = row.get("descriptor") if isinstance(row.get("descriptor"), Mapping) else {}
+        descriptor_text = ",".join(f"{key}:{value}" for key, value in descriptor.items() if value) or str(row.get("description") or "")
+        depth = min(_positive_float(row.get("bid_depth")), _positive_float(row.get("ask_depth")))
+        lines.append(
+            f"| {idx} | `{row.get('coin')}` | {row.get('side')} | {row.get('category')} | {_fmt(row.get('score'))} | "
+            f"{_fmt(row.get('mid'))} | {_fmt(row.get('best_bid'))} | {_fmt(row.get('best_ask'))} | {_fmt(row.get('spread'))} | "
+            f"{_fmt(depth)} | {descriptor_text} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Model Discipline",
+            "",
+            "- Provenance: outcome metadata, mids, and orderbook are observed public Hyperliquid data; hedge context is inferred.",
+            "- Edge class: liquidity/latency or model-relative unless a narrative market is explicitly mapped.",
+            "- Participant lens: retail sees bounded-loss outcomes, institutions see hedge/capacity context, market makers see inventory plus hedge-basis risk.",
+            "- Tradability remains unvalidated until spread, depth, expiry, settlement, and hedge-basis checks pass.",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
 def _diversified_kalshi_markets(markets: Sequence[Mapping[str, object]], *, max_targets: int) -> list[Mapping[str, object]]:
     selected = []
     selected_categories = set()
@@ -1243,6 +1381,87 @@ def _kalshi_deadline_days(row: Mapping[str, object], now: datetime) -> Optional[
     if dt is None:
         return None
     return round((dt - now).total_seconds() / 86400, 3)
+
+
+def _hyperliquid_question_by_outcome(questions: Sequence[Mapping[str, object]]) -> dict[int, Mapping[str, object]]:
+    mapping: dict[int, Mapping[str, object]] = {}
+    for question in questions:
+        for key in ("fallbackOutcome",):
+            value = question.get(key)
+            if isinstance(value, int):
+                mapping[value] = question
+        for value in question.get("namedOutcomes") or []:
+            if isinstance(value, int):
+                mapping[value] = question
+    return mapping
+
+
+def _hyperliquid_descriptor(description: object) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for part in str(description or "").split("|"):
+        if ":" not in part:
+            continue
+        key, value = part.split(":", 1)
+        result[key.strip()] = value.strip()
+    return result
+
+
+def _hyperliquid_book_summary(book: Mapping[str, object]) -> dict[str, Optional[float]]:
+    levels = book.get("levels") if isinstance(book.get("levels"), list) else []
+    bids = levels[0] if len(levels) >= 1 and isinstance(levels[0], list) else []
+    asks = levels[1] if len(levels) >= 2 and isinstance(levels[1], list) else []
+    best_bid = _book_px(bids[0]) if bids else None
+    best_ask = _book_px(asks[0]) if asks else None
+    spread = best_ask - best_bid if best_bid is not None and best_ask is not None else None
+    return {
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread": spread,
+        "bid_depth": sum(_positive_float(_book_sz(level)) for level in bids[:10]),
+        "ask_depth": sum(_positive_float(_book_sz(level)) for level in asks[:10]),
+        "book_levels": float(len(bids) + len(asks)),
+    }
+
+
+def _book_px(level: object) -> Optional[float]:
+    return _optional_float(level.get("px")) if isinstance(level, Mapping) else None
+
+
+def _book_sz(level: object) -> Optional[float]:
+    return _optional_float(level.get("sz")) if isinstance(level, Mapping) else None
+
+
+def _hyperliquid_category(description: object) -> str:
+    descriptor = _hyperliquid_descriptor(description)
+    underlying = str(descriptor.get("underlying") or "").lower()
+    if underlying in {"btc", "eth", "sol"}:
+        return "crypto_outcome"
+    return _target_category_from_text(str(description or ""))
+
+
+def _hyperliquid_query_terms(outcome: Mapping[str, object], max_terms: int = 6) -> list[str]:
+    text = " ".join([str(outcome.get("name") or ""), str(outcome.get("description") or ""), str(outcome.get("outcome") or "")])
+    counts = Counter(
+        term
+        for term in words(text)
+        if len(term) > 2 and not term.isdigit() and term not in DISCOVERY_STOPWORDS and term not in {"class", "index", "period"}
+    )
+    prioritized = sorted(counts, key=lambda term: ((term not in NARRATIVE_MARKERS), -counts[term], term))
+    return prioritized[:max_terms]
+
+
+def _optional_float(value: object) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _positive_float(value: object) -> float:
+    parsed = _optional_float(value)
+    return max(0.0, parsed or 0.0)
 
 
 class RedditPublicClient:

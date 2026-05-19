@@ -308,6 +308,8 @@ The public seed layer is configured in `config/source_discovery_v2.yaml`. It map
 
 Discovery also includes Kalshi public hot-pool context by default. Kalshi markets are treated as cross-venue discussion scope only: reports require rule/deadline/spread/liquidity mapping before any Polymarket inference, and no broker, credential, or order endpoint is used.
 
+Prediction venues are configured in `config/prediction_venues.yaml`: Polymarket is the narrative/FOMO primary venue, Kalshi is regulated event-contract context, and Hyperliquid HIP-4 is high-frequency outcome CLOB context with perp/spot hedge analysis kept as inferred research.
+
 ### 5. Wallet Research
 
 ```bash
@@ -326,6 +328,7 @@ The wallet collector is read-only. It does not use private keys, trading APIs, o
 | Discover markets | `python3 -m quant_sol.signals discover-markets --category politics` |
 | Discover signal sources | `python3 -m quant_sol.signals discover-signal-sources --focus narrative --max-markets 8 --daily-cap 200 --include-public-seeds` |
 | Discover Kalshi targets | `python3 -m quant_sol.signals discover-kalshi-targets --focus narrative --max-markets 12` |
+| Discover Hyperliquid HIP-4 targets | `python3 -m quant_sol.signals discover-hyperliquid-hip4-targets --max-markets 12` |
 | Evaluate one account source | `python3 -m quant_sol.signals evaluate-account-source --handle _FORAB --lookback 7d --daily-cap 200` |
 | Diagnose scoring/model setup | `python3 -m quant_sol.signals diagnose-model` |
 | Mine historical price events | `python3 -m quant_sol.signals mine-price-events --case <case>` |

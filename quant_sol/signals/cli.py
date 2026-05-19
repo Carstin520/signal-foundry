@@ -40,9 +40,11 @@ from .config import (
 from .env import has_secret, load_local_env, masked_secret
 from .diagnostics import model_diagnostics, write_model_diagnostics
 from .discovery import (
+    discover_hyperliquid_hip4_targets,
     discover_kalshi_targets,
     discover_signal_source_candidates,
     planned_x_calls_for_discovery,
+    write_latest_hyperliquid_hip4_targets,
     write_latest_kalshi_targets,
     write_latest_polymarket_targets,
     write_signal_discovery_report,
@@ -201,6 +203,20 @@ def discover_kalshi_market_targets(
     if latest_targets_path:
         path = write_latest_kalshi_targets(result, latest_targets_path)
         console.print(f"Wrote latest Kalshi targets: {path}")
+
+
+@app.command("discover-hyperliquid-hip4-targets")
+def discover_hyperliquid_hip4_market_targets(
+    max_markets: int = typer.Option(12, "--max-markets", help="Maximum HIP-4 outcome sides to keep."),
+    include_orderbooks: bool = typer.Option(True, "--include-orderbooks/--no-orderbooks", help="Fetch l2Book for each outcome side."),
+    latest_targets_path: Optional[Path] = typer.Option(None, "--latest-targets-path", help="Overwrite a concise Hyperliquid HIP-4 latest-targets markdown file."),
+) -> None:
+    """Find Hyperliquid HIP-4 outcome markets through public info endpoints."""
+    result = discover_hyperliquid_hip4_targets(max_markets=max_markets, include_orderbooks=include_orderbooks)
+    _render_hyperliquid_hip4_targets(result)
+    if latest_targets_path:
+        path = write_latest_hyperliquid_hip4_targets(result, latest_targets_path)
+        console.print(f"Wrote latest Hyperliquid HIP-4 targets: {path}")
 
 
 @app.command("sync-social")
@@ -1698,6 +1714,38 @@ def _render_kalshi_targets(result: dict) -> None:
             _fmt(item.get("open_interest")),
             _fmt(item.get("spread")),
             ", ".join(item.get("query_terms") or []),
+        )
+    console.print(table)
+
+
+def _render_hyperliquid_hip4_targets(result: dict) -> None:
+    table = Table(title="Hyperliquid HIP-4 Outcome Markets")
+    table.add_column("Rank", justify="right")
+    table.add_column("Coin")
+    table.add_column("Side")
+    table.add_column("Category")
+    table.add_column("Score", justify="right")
+    table.add_column("Mid", justify="right")
+    table.add_column("Bid", justify="right")
+    table.add_column("Ask", justify="right")
+    table.add_column("Spread", justify="right")
+    table.add_column("Descriptor")
+    for idx, item in enumerate((result.get("markets") or [])[:30], start=1):
+        descriptor = item.get("descriptor") if isinstance(item.get("descriptor"), dict) else {}
+        descriptor_text = ",".join(
+            f"{key}:{value}" for key, value in descriptor.items() if key in {"class", "underlying", "expiry", "targetPrice"}
+        )
+        table.add_row(
+            str(idx),
+            str(item.get("coin") or ""),
+            str(item.get("side") or ""),
+            str(item.get("category") or ""),
+            _fmt(item.get("score")),
+            _fmt(item.get("mid")),
+            _fmt(item.get("best_bid")),
+            _fmt(item.get("best_ask")),
+            _fmt(item.get("spread")),
+            descriptor_text,
         )
     console.print(table)
 

@@ -1,7 +1,10 @@
 from datetime import datetime, timedelta, timezone
 
+from quant_sol.signals.config import load_prediction_venues
 from quant_sol.signals.discovery import (
+    discover_hyperliquid_hip4_targets,
     discover_kalshi_hot_markets,
+    hyperliquid_hip4_interest_score,
     kalshi_interest_score,
     kalshi_cross_venue_candidates_for_markets,
     discover_interesting_markets,
@@ -11,6 +14,7 @@ from quant_sol.signals.discovery import (
     platform_watch_candidates_for_markets,
     public_seed_candidates_for_markets,
     rank_discovered_sources,
+    write_latest_hyperliquid_hip4_targets,
     write_latest_kalshi_targets,
     write_latest_polymarket_targets,
     write_signal_discovery_report,
@@ -312,6 +316,88 @@ def test_kalshi_cross_venue_matches_require_rule_and_spread_checks() -> None:
     assert rows[0]["recommended_status"] == "cross_venue_context"
     assert rows[0]["tradability"]["status"] == "not_tradable_without_rule_mapping_and_spread_check"
     assert "venue_rule_mismatch" in rows[0]["risk_tags"]
+
+
+def test_hyperliquid_hip4_targets_parse_outcome_meta_and_orderbook() -> None:
+    class FakeHyperliquid:
+        def outcome_meta(self):
+            return {
+                "outcomes": [
+                    {
+                        "outcome": 65,
+                        "name": "Recurring",
+                        "description": "class:priceBinary|underlying:BTC|expiry:20260520-0600|targetPrice:76886|period:1d",
+                        "sideSpecs": [{"name": "Yes"}, {"name": "No"}],
+                    }
+                ],
+                "questions": [],
+            }
+
+        def all_mids(self):
+            return {"#650": "0.602495", "#651": "0.397505"}
+
+        def l2_book(self, coin):
+            return {
+                "coin": coin,
+                "levels": [
+                    [{"px": "0.59961", "sz": "214.0", "n": 2}, {"px": "0.59654", "sz": "7015.0", "n": 1}],
+                    [{"px": "0.6085", "sz": "27.0", "n": 1}, {"px": "0.6296", "sz": "7324.0", "n": 1}],
+                ],
+            }
+
+    result = discover_hyperliquid_hip4_targets(max_markets=2, client=FakeHyperliquid())
+    row = result["markets"][0]
+
+    assert row["venue"] == "hyperliquid_hip4"
+    assert row["coin"] in {"#650", "#651"}
+    assert row["descriptor"]["underlying"] == "BTC"
+    assert row["data_provenance"]["price_path"] == "observed_all_mids_and_l2_book"
+    assert row["edge_classification"] == "liquidity_latency_or_model_relative_edge"
+    assert row["tradability"]["status"] == "research_only_until_spread_depth_and_settlement_checked"
+    assert "no_order_execution" in row["risk_tags"]
+
+
+def test_hyperliquid_hip4_report_keeps_hedge_context_inferred(tmp_path) -> None:
+    path = tmp_path / "latest-hyperliquid.md"
+    write_latest_hyperliquid_hip4_targets(
+        {
+            "markets": [
+                {
+                    "coin": "#650",
+                    "side": "Yes",
+                    "category": "crypto_outcome",
+                    "score": hyperliquid_hip4_interest_score(
+                        mid=0.6,
+                        spread=0.01,
+                        bid_depth=1000,
+                        ask_depth=900,
+                        description="class:priceBinary|underlying:BTC|expiry:20260520-0600|targetPrice:76886",
+                    ),
+                    "mid": 0.6,
+                    "best_bid": 0.599,
+                    "best_ask": 0.609,
+                    "spread": 0.01,
+                    "bid_depth": 1000,
+                    "ask_depth": 900,
+                    "descriptor": {"class": "priceBinary", "underlying": "BTC", "expiry": "20260520-0600"},
+                }
+            ]
+        },
+        path,
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert "Latest Hyperliquid HIP-4 Targets" in text
+    assert "high_frequency_outcome_clob" in text
+    assert "hedge context is inferred" in text
+
+
+def test_prediction_venues_config_encodes_three_roles() -> None:
+    venues = load_prediction_venues()
+
+    assert venues["polymarket"]["role"] == "narrative_fomo_primary"
+    assert venues["kalshi"]["role"] == "regulated_event_context"
+    assert venues["hyperliquid_hip4"]["role"] == "high_frequency_outcome_clob"
 
 
 def test_signal_discovery_report_includes_preflight_platforms_and_model_review(tmp_path) -> None:
