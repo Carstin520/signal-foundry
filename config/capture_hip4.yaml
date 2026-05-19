@@ -1,0 +1,32 @@
+mode: read_only
+venue: hip4
+websocket_url: wss://api.hyperliquid.xyz/ws
+
+channels:
+  - l2Book
+  - trades
+
+markets:
+  - coin: "#651"
+    market_uid: "hip4:#651"
+    label: "BTC priceBinary No, current target doc rank 1"
+  - coin: "#650"
+    market_uid: "hip4:#650"
+    label: "BTC priceBinary Yes, current target doc rank 2"
+  - coin: "#690"
+    market_uid: "hip4:#690"
+    label: "HIP-4 outcome side, current target doc rank 3"
+
+data_root: data/raw
+snapshot_root: data/raw/l2_snapshots
+trade_root: data/raw/l2_trades
+
+max_book_levels: 10
+gap_warn_seconds: 5
+flush_rows: 5000
+flush_interval_seconds: 10
+
+reconnect:
+  initial_backoff_seconds: 1
+  max_backoff_seconds: 60
+  multiplier: 2
